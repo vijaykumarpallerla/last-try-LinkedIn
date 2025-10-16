@@ -22,3 +22,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+.env
+settings.json
+smtp_test.py
