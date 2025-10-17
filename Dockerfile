@@ -22,8 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	chromium \
  && rm -rf /var/lib/apt/lists/*
 
-# Set CHROME_BIN so the app can find Chromium in container
-ENV CHROME_BIN=/usr/bin/chromium
+# Ensure common chromium binary names exist and set CHROME_BIN so the app can find Chromium
+RUN if [ -x /usr/bin/chromium-browser ]; then ln -sf /usr/bin/chromium-browser /usr/bin/chromium; \
+	elif [ -x /usr/bin/chromium ]; then ln -sf /usr/bin/chromium /usr/bin/chromium-browser; fi
+ENV CHROME_BIN=/usr/bin/chromium-browser
 ENV PYTHONUNBUFFERED=1
 
 # Install Python deps
