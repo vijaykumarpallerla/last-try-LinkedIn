@@ -13,5 +13,6 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 
-# Use startup script so we can bind to $PORT provided by Render
+# Ensure the start script is executable and use it so we can bind to $PORT provided by Render
+RUN chmod +x ./start.sh || true
 CMD ["./start.sh"]
