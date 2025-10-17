@@ -2501,6 +2501,31 @@ def latest_screenshot():
         return jsonify({'ok': False, 'error': 'failed'}), 500
 
 
+@app.route('/screenshot/token/<token>')
+def screenshot_for_token(token):
+    """Serve a paused-session screenshot saved under data/screenshots/{token}.png
+
+    This is useful when live view isn't updating; admins can open this URL to download the exact
+    screenshot captured when the session paused.
+    """
+    try:
+        # If the paused session has a path recorded, prefer that
+        ss_path = None
+        try:
+            if token in paused_sessions:
+                ss_path = paused_sessions.get(token, {}).get('screenshot')
+        except Exception:
+            ss_path = None
+        if not ss_path:
+            ss_path = os.path.join('data', 'screenshots', f'{token}.png')
+        if not os.path.exists(ss_path):
+            return jsonify({'ok': False, 'error': 'screenshot not found', 'path': ss_path}), 404
+        return send_file(ss_path, mimetype='image/png')
+    except Exception:
+        logger.exception('Failed to serve token screenshot')
+        return jsonify({'ok': False, 'error': 'failed'}), 500
+
+
 @app.route('/stop', methods=['POST'])
 def stop_scraper():
     """Allow the user to immediately stop the running scraper."""
@@ -3012,6 +3037,193 @@ def api_submit_otp():
         return jsonify({'ok': True, 'message': 'OTP submitted; scraper will attempt to resume.'})
     except Exception as e:
         logger.exception('Error injecting OTP into paused session')
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/remote/click', methods=['POST'])
+def api_remote_click():
+    """Remote click into paused Selenium session.
+
+    Expected JSON: {token: str, x: float, y: float}
+    x,y are normalized coords (0..1) relative to the served live screenshot image.
+    The server maps them into the page viewport using JS-exposed window.innerWidth/innerHeight
+    and attempts a native click via ActionChains. Falls back to elementFromPoint+dispatchEvent.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    token = data.get('token')
+    if not token or token not in paused_sessions:
+        return jsonify({'ok': False, 'error': 'invalid or expired token'}), 400
+    try:
+        x = float(data.get('x'))
+        y = float(data.get('y'))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'x and y (normalized floats) required'}), 400
+    sess = paused_sessions.get(token)
+    driver = sess.get('driver_ref') if sess else None
+    if not driver:
+        return jsonify({'ok': False, 'error': 'server-side browser session not available'}), 500
+    try:
+        # Ask the page for its viewport size via JS so we can convert normalized coords
+        try:
+            vw = driver.execute_script('return window.innerWidth||document.documentElement.clientWidth')
+            vh = driver.execute_script('return window.innerHeight||document.documentElement.clientHeight')
+        except Exception:
+            vw = None
+            vh = None
+        if vw and vh:
+            px = int(max(0, min(1, x)) * int(vw))
+            py = int(max(0, min(1, y)) * int(vh))
+        else:
+            # Fallback: assume 1920x1080
+            px = int(max(0, min(1, x)) * 1920)
+            py = int(max(0, min(1, y)) * 1080)
+
+        # Try a native Selenium click by computing element at point using JS
+        performed = False
+        try:
+            # Try elementFromPoint to get the element and scroll into view then click via ActionChains
+            el = driver.execute_script('return document.elementFromPoint(arguments[0], arguments[1]);', px, py)
+            if el:
+                # We have an element reference; try to click it natively
+                try:
+                    # Move to location and click
+                    ActionChains(driver).move_by_offset(0, 0).perform()
+                except Exception:
+                    pass
+                try:
+                    # Use JS to click the element directly if possible
+                    driver.execute_script('arguments[0].scrollIntoView({block:"center"});', el)
+                except Exception:
+                    pass
+                try:
+                    ActionChains(driver).move_to_element_with_offset(el, 1, 1).click().perform()
+                    performed = True
+                except Exception:
+                    try:
+                        driver.execute_script('arguments[0].click();', el)
+                        performed = True
+                    except Exception:
+                        performed = False
+        except Exception:
+            performed = False
+
+        # If the above didn't work, try dispatching a pointer event at page coordinates
+        if not performed:
+            try:
+                js = (
+                    'var ev = new MouseEvent("click", {bubbles:true, cancelable:true, clientX:arguments[0], clientY:arguments[1]});'
+                    'var el = document.elementFromPoint(arguments[0], arguments[1]); if(el) el.dispatchEvent(ev); return !!el;'
+                )
+                ok = driver.execute_script(js, px, py)
+                performed = bool(ok)
+            except Exception:
+                performed = False
+
+        # Save a live screenshot so UI can refresh immediately
+        try:
+            _save_live_screenshot(driver)
+        except Exception:
+            pass
+
+        if performed:
+            return jsonify({'ok': True, 'message': 'clicked', 'px': px, 'py': py})
+        else:
+            return jsonify({'ok': False, 'error': 'click failed'}), 500
+    except Exception as e:
+        logger.exception('api_remote_click error')
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/remote/type', methods=['POST'])
+def api_remote_type():
+    """Send text input to the active/focused element in the paused session.
+
+    Expected JSON: {token: str, text: str}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    token = data.get('token')
+    text = data.get('text')
+    if not token or token not in paused_sessions:
+        return jsonify({'ok': False, 'error': 'invalid or expired token'}), 400
+    if text is None:
+        return jsonify({'ok': False, 'error': 'text required'}), 400
+    sess = paused_sessions.get(token)
+    driver = sess.get('driver_ref') if sess else None
+    if not driver:
+        return jsonify({'ok': False, 'error': 'server-side browser session not available'}), 500
+    try:
+        try:
+            active = driver.switch_to.active_element
+            active.click()
+            active.clear()
+            active.send_keys(text)
+        except Exception:
+            # Fallback: focus body and send keys
+            try:
+                driver.execute_script('document.activeElement && document.activeElement.blur && document.activeElement.blur();')
+            except Exception:
+                pass
+            try:
+                driver.execute_script('var i = document.querySelector("input[type=text], input[type=tel], input[name*=otp], textarea"); if(i){ i.focus(); }')
+                el = driver.switch_to.active_element
+                el.send_keys(text)
+            except Exception:
+                driver.execute_script('console.warn("remote type fallback failed")')
+                return jsonify({'ok': False, 'error': 'failed to type into element'}), 500
+        try:
+            _save_live_screenshot(driver)
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'message': 'typed'})
+    except Exception as e:
+        logger.exception('api_remote_type error')
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/remote/key', methods=['POST'])
+def api_remote_key():
+    """Send a special key (Enter, Tab, Escape) to the active element.
+
+    Expected JSON: {token: str, key: 'Enter'|'Tab'|'Escape'}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    token = data.get('token')
+    key = data.get('key')
+    if not token or token not in paused_sessions:
+        return jsonify({'ok': False, 'error': 'invalid or expired token'}), 400
+    if not key:
+        return jsonify({'ok': False, 'error': 'key required'}), 400
+    sess = paused_sessions.get(token)
+    driver = sess.get('driver_ref') if sess else None
+    if not driver:
+        return jsonify({'ok': False, 'error': 'server-side browser session not available'}), 500
+    try:
+        k = key.lower()
+        from selenium.webdriver.common.keys import Keys as SKeys
+        mapping = {
+            'enter': SKeys.ENTER,
+            'tab': SKeys.TAB,
+            'escape': SKeys.ESCAPE,
+            'esc': SKeys.ESCAPE,
+        }
+        send = mapping.get(k)
+        if not send:
+            return jsonify({'ok': False, 'error': 'unsupported key'}), 400
+        try:
+            active = driver.switch_to.active_element
+            active.send_keys(send)
+        except Exception:
+            try:
+                driver.execute_script('document.activeElement && document.activeElement.dispatchEvent(new KeyboardEvent("keydown", {key: arguments[0]}));', key)
+            except Exception:
+                return jsonify({'ok': False, 'error': 'failed to send key'}), 500
+        try:
+            _save_live_screenshot(driver)
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'message': 'key sent'})
+    except Exception as e:
+        logger.exception('api_remote_key error')
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
