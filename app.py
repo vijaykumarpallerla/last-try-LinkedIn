@@ -2463,6 +2463,28 @@ def status():
         report['stop_requested'] = stop_event.is_set()
     except Exception:
         report['stop_requested'] = False
+    # If there's an active paused session, include a public token and a submit URL
+    try:
+        if paused_sessions:
+            # pick the most-recent paused token (insertion order)
+            try:
+                token = next(iter(paused_sessions.keys()))
+                report['paused_token'] = token
+                # include a job hint if available
+                try:
+                    hj = paused_sessions.get(token, {}).get('job_hint')
+                    report['paused_job_hint'] = hj
+                except Exception:
+                    report['paused_job_hint'] = None
+                base = os.getenv('BASE_URL') or (request.url_root.rstrip('/') if request else None)
+                if base:
+                    report['paused_submit_url'] = f"{base}/submit-otp?token={token}"
+                else:
+                    report['paused_submit_url'] = f"/submit-otp?token={token}"
+            except Exception:
+                pass
+    except Exception:
+        pass
     return jsonify(report)
 
 
