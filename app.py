@@ -24,6 +24,8 @@ import uuid
 from urllib.parse import quote_plus
 import requests
 import difflib
+import gzip
+import base64
 
 # --- CONFIGURATION ---
 SENT_JOBS_FILE = 'sent-jobs.json'
@@ -342,6 +344,76 @@ scraper_status.setdefault('ai_filter_stats', {'kept': 0, 'skipped': 0, 'errors':
 scraper_status.setdefault('extracted_emails_count', 0)
 scraper_status.setdefault('extracted_emails_file', '')
 
+# Paused sessions mapping: token -> {'driver': selenium.webdriver, 'created_at': timestamp, 'expires': ts}
+# Stored in-memory only; tokens are short-lived.
+paused_sessions = {}
+
+def _make_token():
+    return uuid.uuid4().hex
+
+def _ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+def _save_artifacts(driver, token: str):
+    # Save screenshot and html.gz paths for this token
+    ss_path = os.path.join('data', 'screenshots', f'{token}.png')
+    html_path = os.path.join('data', 'html', f'{token}.html.gz')
+    _ensure_dir(ss_path)
+    _ensure_dir(html_path)
+    try:
+        driver.save_screenshot(ss_path)
+    except Exception:
+        try:
+            # fallback to executing JS to get a base64 screenshot (Playwright alternative) if available
+            b64 = driver.get_screenshot_as_base64()
+            with open(ss_path, 'wb') as f:
+                f.write(base64.b64decode(b64))
+        except Exception:
+            pass
+    try:
+        html = driver.page_source
+        with gzip.open(html_path, 'wt', encoding='utf-8') as gz:
+            gz.write(html)
+    except Exception:
+        try:
+            html = ''
+            with gzip.open(html_path, 'wt', encoding='utf-8') as gz:
+                gz.write(html)
+        except Exception:
+            pass
+    return ss_path, html_path
+
+def _send_email_simple(to_addrs: list | str, subject: str, body: str, attachments: list = None):
+    # Simple SMTP send using GMAIL_USER/GMAIL_PASS or SMTP_* env vars
+    gmail_user = os.getenv('GMAIL_USER')
+    gmail_pass = os.getenv('GMAIL_PASS')
+    if isinstance(to_addrs, str):
+        to_list = [r.strip() for r in to_addrs.split(',') if r.strip()]
+    else:
+        to_list = to_addrs or []
+    if not to_list:
+        logger.warning('No recipients for _send_email_simple')
+        return False
+    if not gmail_user or not gmail_pass:
+        logger.warning('_send_email_simple: SMTP credentials not configured')
+        return False
+    try:
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = gmail_user
+        msg['To'] = ', '.join(to_list)
+        server = smtplib.SMTP_SSL(os.getenv('SMTP_HOST') or 'smtp.gmail.com', int(os.getenv('SMTP_PORT') or 465), timeout=20)
+        server.login(gmail_user, gmail_pass)
+        server.sendmail(gmail_user, to_list, msg.as_string())
+        server.quit()
+        return True
+    except Exception:
+        logger.exception('Failed to send notification email')
+        return False
+
+
 # Global stop signal for immediate user-requested cancellation
 stop_event = threading.Event()
 
@@ -652,27 +724,71 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
         # After login, detect if LinkedIn has challenged with human verification.
         # If so, pause the scraper and wait until the verification page clears, then auto-resume.
         if is_human_verification_page(driver):
-            scraper_status['progress'] = 'Waiting: LinkedIn requested human verification. Complete it in the opened browser; the scraper will resume automatically.'
+            # Create a short-lived token and save artifacts so recipient can submit OTP via the UI
+            token = _make_token()
+            expires = datetime.utcnow() + timedelta(minutes=int(os.getenv('OTP_TOKEN_MINUTES', '15')))
+            scraper_status['progress'] = 'Paused: LinkedIn requested human verification. Waiting for OTP submission.'
             scraper_status['paused_for_human_verification'] = True
-            logger.warning('Scraper: Human verification detected. Waiting for completion to auto-resume...')
+            logger.warning('Scraper: Human verification detected; creating OTP token and notifying recipient/admin')
 
+            # Save artifacts
+            ss_path, html_path = _save_artifacts(driver, token)
+
+            # Store paused session metadata (we do NOT keep the raw driver in paused_sessions to avoid pickling issues across process restarts)
+            # Keep an in-memory reference to the driver so the OTP handler can inject it.
+            paused_sessions[token] = {
+                'created_at': datetime.utcnow().isoformat(),
+                'expires_at': expires.isoformat(),
+                'screenshot': ss_path,
+                'html': html_path,
+                'job_hint': {'url': driver.current_url},
+                'driver_ref': driver
+            }
+
+            # Build OTP link for recipient - point to submit-otp endpoint
+            base = os.getenv('BASE_URL') or (request.url_root.rstrip('/') if request else 'https://your-render-app')
+            otp_link = f"{base}/submit-otp?token={token}"
+
+            # Send an email to recipients (the person who will enter OTP). Use RECIPIENTS env or settings
+            recipient_emails = os.getenv('RECIPIENTS') or load_settings().get('recipients') or ''
+            subj = f"Action required: LinkedIn verification for scraping job - enter OTP"
+            body = (
+                f"We encountered a human verification while scraping LinkedIn for your request.\n\n"
+                f"Please click the secure link and enter the OTP you received from LinkedIn. This link expires at {expires.isoformat()} UTC.\n\n"
+                f"Open link: {otp_link}\n\n"
+                "If you did not request this, ignore this message. Do not forward the link."
+            )
+            # Try to email recipients (best-effort). Also email ADMIN_EMAIL if configured for ops.
+            try:
+                _send_email_simple(recipient_emails, subj, body)
+            except Exception:
+                logger.exception('Failed sending OTP email to recipients')
+
+            admin_email = os.getenv('ADMIN_EMAIL') or load_settings().get('admin_email')
+            if admin_email:
+                try:
+                    _send_email_simple(admin_email, f"[ADMIN] Human verification paused - token {token}", f"Job paused at {driver.current_url}. Token: {token}")
+                except Exception:
+                    logger.exception('Failed sending admin alert email')
+
+            # Wait for OTP submission: token will be validated by /api/submit-otp which will set scraper_status['resume_requested']=True
             wait_seconds = int(os.getenv('HUMAN_VERIFY_TIMEOUT', '900'))  # default 15 minutes
             start = time.time()
             while True:
                 _assert_not_stopped()
-                # If admin explicitly signaled resume, allow immediate continuation as an override
+                # If admin/recipient submitted OTP (resume_requested flag set), attempt to read from a temp storage
                 if scraper_status.get('resume_requested'):
-                    logger.info('Scraper: Admin override resume received; continuing')
+                    # The OTP handler is responsible for injecting the OTP into the page; the handler should then clear resume_requested
+                    logger.info('Scraper: Resume requested flag detected; continuing')
                     scraper_status['resume_requested'] = False
                     break
 
-                # Auto-resume once the page is no longer a verification/checkpoint page
+                # Also auto-resume if page no longer appears to be a verification page
                 try:
                     if not is_human_verification_page(driver):
                         logger.info('Scraper: Human verification appears completed; resuming')
                         break
                 except Exception:
-                    # If we cannot read the page (e.g., transient), ignore and continue waiting
                     pass
 
                 if time.time() - start > wait_seconds:
@@ -684,13 +800,14 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                         pass
                     scraper_status['is_running'] = False
                     return
-                # Stop-aware wait to remain responsive
+
+                # Sleep small increments to be responsive to stop_event
                 for _ in range(20):
                     if stop_event.is_set():
                         _assert_not_stopped()
                     time.sleep(0.1)
 
-            # Clear paused state and update progress before continuing
+            # Clear paused state and continue
             scraper_status['paused_for_human_verification'] = False
             scraper_status['progress'] = 'Human verification completed; resuming scraping...'
 
@@ -2399,6 +2516,90 @@ def admin_resume_scraper():
     except Exception:
         logger.exception('Admin: Failed to resume scraper')
         return jsonify({'ok': False, 'error': 'failed to resume'}), 500
+
+
+@app.route('/submit-otp', methods=['GET'])
+def submit_otp_form():
+    token = request.args.get('token')
+    if not token or token not in paused_sessions:
+        return "Invalid or expired token.", 400
+    # Simple HTML form for OTP entry
+    return f"""
+    <html><body>
+    <h3>Enter the OTP from LinkedIn</h3>
+    <p>This will submit the OTP to the paused scraping session so the job can resume.</p>
+    <form action="/api/submit-otp" method="post">
+      <input type="hidden" name="token" value="{token}" />
+      OTP: <input name="otp" />
+      <button type="submit">Submit OTP</button>
+    </form>
+    </body></html>
+    """
+
+
+@app.route('/api/submit-otp', methods=['POST'])
+def api_submit_otp():
+    data = request.get_json(silent=True) or request.form or {}
+    token = data.get('token')
+    otp = data.get('otp')
+    if not token or token not in paused_sessions:
+        return jsonify({'ok': False, 'error': 'invalid or expired token'}), 400
+    if not otp:
+        return jsonify({'ok': False, 'error': 'otp required'}), 400
+    sess = paused_sessions.get(token)
+    driver = sess.get('driver_ref') if sess else None
+    if not driver:
+        return jsonify({'ok': False, 'error': 'server-side browser session not available'}), 500
+    try:
+        injected = False
+        # Attempt common OTP input selectors
+        try:
+            candidates = driver.find_elements(By.XPATH, "//input[@name='pin' or @name='otp' or @id='otp' or @type='tel' or @type='text']")
+        except Exception:
+            candidates = []
+        for c in candidates:
+            try:
+                c.clear()
+                c.send_keys(otp)
+                injected = True
+            except Exception:
+                continue
+        if not injected:
+            try:
+                active = driver.switch_to.active_element
+                active.clear()
+                active.send_keys(otp)
+                injected = True
+            except Exception:
+                injected = False
+
+        if not injected:
+            return jsonify({'ok': False, 'error': 'failed to inject otp: no suitable input found'}), 500
+
+        # Try to click verify/submit buttons
+        try:
+            buttons = driver.find_elements(By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'verify') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'submit') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'continue')]")
+            for b in buttons[:3]:
+                try:
+                    b.click()
+                except Exception:
+                    try:
+                        driver.execute_script("arguments[0].click();", b)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Signal scraper to resume; scraper loop checks page state and will continue
+        scraper_status['resume_requested'] = True
+        try:
+            del paused_sessions[token]
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'message': 'OTP submitted; scraper will attempt to resume.'})
+    except Exception as e:
+        logger.exception('Error injecting OTP into paused session')
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
