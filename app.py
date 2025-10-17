@@ -774,9 +774,41 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                     pass
             else:
                 # Use webdriver-manager to automatically download/locate chromedriver matching installed browser
-                chromedriver_path = ChromeDriverManager().install()
-                service = Service(executable_path=chromedriver_path)
-                logger.info(f'Scraper: Using chromedriver at {chromedriver_path}')
+                # Try to detect the installed browser version so webdriver-manager can fetch a compatible driver
+                try:
+                    browser_bin = chrome_options.binary_location or shutil.which('chromium') or shutil.which('chromium-browser') or shutil.which('google-chrome')
+                    browser_version = None
+                    if browser_bin and os.path.exists(browser_bin):
+                        try:
+                            out = os.popen(f'"{browser_bin}" --version').read().strip()
+                            logger.info(f'Scraper: Detected browser version output: {out}')
+                            # Try to extract full dotted version like 141.0.7390.107
+                            m = re.search(r"(\d+\.\d+\.\d+\.\d+)", out)
+                            if m:
+                                browser_version = m.group(1)
+                            else:
+                                # fallback to major version
+                                m2 = re.search(r"(\d+)\.", out)
+                                if m2:
+                                    browser_version = m2.group(1)
+                        except Exception:
+                            logger.exception('Failed to read browser version')
+
+                    if browser_version:
+                        try:
+                            logger.info(f'Scraper: Requesting chromedriver for browser version: {browser_version}')
+                            chromedriver_path = ChromeDriverManager(version=browser_version).install()
+                            service = Service(executable_path=chromedriver_path)
+                            logger.info(f'Scraper: Using chromedriver at {chromedriver_path} (matched to browser)')
+                        except Exception:
+                            logger.exception('Scraper: webdriver-manager failed to install matching chromedriver; falling back to default')
+                            chromedriver_path = ChromeDriverManager().install()
+                            service = Service(executable_path=chromedriver_path)
+                            logger.info(f'Scraper: Using chromedriver at {chromedriver_path}')
+                    else:
+                        chromedriver_path = ChromeDriverManager().install()
+                        service = Service(executable_path=chromedriver_path)
+                        logger.info(f'Scraper: Using chromedriver at {chromedriver_path}')
         except Exception:
             # Fallback: assume chromedriver is on PATH
             logger.warning('Scraper: webdriver-manager/system chromedriver detection failed, falling back to PATH for chromedriver')
