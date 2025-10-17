@@ -28,6 +28,7 @@ import difflib
 import gzip
 import base64
 import shutil
+import sys
 
 # --- CONFIGURATION ---
 SENT_JOBS_FILE = 'sent-jobs.json'
@@ -65,6 +66,44 @@ def _load_dotenv_optional(env_path='.env'):
 
 
 _load_dotenv_optional()
+
+# Helper: on Windows, try reading Chrome version from registry when --version output is unreliable
+def get_windows_chrome_version():
+    try:
+        import winreg
+    except Exception:
+        return None
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for sub in (r"SOFTWARE\\Google\\Chrome\\BLBeacon", r"SOFTWARE\\WOW6432Node\\Google\\Chrome\\BLBeacon"):
+            try:
+                with winreg.OpenKey(hive, sub) as k:
+                    try:
+                        val, _ = winreg.QueryValueEx(k, 'version')
+                        if val:
+                            return val
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    return None
+
+
+def is_chrome_running_on_windows():
+    """Return True if any chrome.exe processes are running on Windows."""
+    try:
+        if not sys.platform.startswith('win'):
+            return False
+        # Use tasklist to detect chrome.exe processes
+        out = os.popen('tasklist /FI "IMAGENAME eq chrome.exe" /NH').read()
+        if not out:
+            return False
+        # tasklist returns a line with 'INFO: No tasks are running which match the specified criteria.' when none
+        if 'No tasks are running' in out or 'INFO:' in out:
+            return False
+        # Otherwise presence of 'chrome.exe' indicates running processes
+        return 'chrome.exe' in out.lower()
+    except Exception:
+        return False
 
 # Create Flask app
 app = Flask(__name__)
@@ -657,17 +696,31 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                 chrome_options.add_argument("--headless=new")
             except Exception:
                 chrome_options.add_argument("--headless")
-        # Required/safe flags for containerized Chrome
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-software-rasterizer")
-        chrome_options.add_argument("--remote-debugging-port=9222")
-        chrome_options.add_argument("--window-size=1920,1080")
-        # Some platforms benefit from this to avoid zygote permission issues
-        chrome_options.add_argument("--no-zygote")
-        chrome_options.add_argument("--single-process")
+        # Platform-specific Chrome flags: minimal on Windows, fuller set in containers/Linux
+        if sys.platform.startswith('win'):
+            # Windows: prefer minimal options to avoid crashes when launching headless Chrome
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--window-size=1920,1080")
+        else:
+            # Non-Windows (Linux/macOS/containers): use more robust flags for containerized Chrome
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--disable-software-rasterizer")
+            chrome_options.add_argument("--remote-debugging-port=9222")
+            chrome_options.add_argument("--window-size=1920,1080")
+            # Some platforms benefit from this to avoid zygote permission issues
+            chrome_options.add_argument("--no-zygote")
+            chrome_options.add_argument("--single-process")
+        # Use an isolated temporary profile to ensure Chrome starts as a separate
+        # instance instead of opening a tab in the user's existing browser.
+        try:
+            profile_dir = tempfile.mkdtemp(prefix='linkedin-scraper-profile-')
+            chrome_options.add_argument(f"--user-data-dir={profile_dir}")
+        except Exception:
+            profile_dir = None
         # Reduce automation flags noise
         try:
             chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
@@ -758,64 +811,187 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
             scraper_status['is_running'] = False
             return
 
-        # Prefer a system-installed chromedriver (from package manager) if present and executable.
-        # This often matches the installed Chromium package on the system and avoids version mismatch.
+        # Choose chromedriver: prefer system-installed, else use webdriver-manager
+        chromedriver_path = None
+        service = None
         try:
             system_cd = shutil.which('chromedriver') or '/usr/bin/chromedriver'
             if system_cd and os.path.exists(system_cd) and os.access(system_cd, os.X_OK):
                 chromedriver_path = system_cd
                 service = Service(executable_path=chromedriver_path)
-                logger.info(f'Scraper: Using system chromedriver at {chromedriver_path}')
+                logger.info(f"Scraper: Using system chromedriver at {chromedriver_path}")
                 try:
                     out = os.popen(f'"{chromedriver_path}" --version').read().strip()
                     if out:
-                        logger.info(f'Scraper: chromedriver version: {out}')
+                        logger.info(f"Scraper: chromedriver version: {out}")
                 except Exception:
                     pass
             else:
-                # Use webdriver-manager to automatically download/locate chromedriver matching installed browser
-                # Try to detect the installed browser version so webdriver-manager can fetch a compatible driver
-                try:
-                    browser_bin = chrome_options.binary_location or shutil.which('chromium') or shutil.which('chromium-browser') or shutil.which('google-chrome')
-                    browser_version = None
-                    if browser_bin and os.path.exists(browser_bin):
-                        try:
+                # Detect browser version and request a matching chromedriver
+                browser_bin = chrome_options.binary_location or shutil.which('chromium') or shutil.which('chromium-browser') or shutil.which('google-chrome')
+                browser_version = None
+                if browser_bin and os.path.exists(browser_bin):
+                    try:
+                        # On Windows calling chrome.exe --version can open a browser window
+                        # (which previously caused an extra empty tab). Prefer reading from
+                        # the registry when on Windows to avoid side effects.
+                        if sys.platform.startswith('win'):
+                            out = get_windows_chrome_version() or ''
+                        else:
                             out = os.popen(f'"{browser_bin}" --version').read().strip()
-                            logger.info(f'Scraper: Detected browser version output: {out}')
-                            # Try to extract full dotted version like 141.0.7390.107
-                            m = re.search(r"(\d+\.\d+\.\d+\.\d+)", out)
-                            if m:
-                                browser_version = m.group(1)
-                            else:
-                                # fallback to major version
-                                m2 = re.search(r"(\d+)\.", out)
-                                if m2:
-                                    browser_version = m2.group(1)
-                        except Exception:
-                            logger.exception('Failed to read browser version')
+                        logger.info(f"Scraper: Detected browser version output: {out}")
+                        # Ignore spurious messages that indicate Chrome opened a UI
+                        if out and 'opening in existing' in out.lower():
+                            out = ''
+                        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", out)
+                        if m:
+                            browser_version = m.group(1)
+                        else:
+                            m2 = re.search(r"(\d+)\.", out)
+                            if m2:
+                                browser_version = m2.group(1)
+                    except Exception:
+                        logger.exception('Failed to read browser version')
 
-                    if browser_version:
-                        try:
-                            logger.info(f'Scraper: Requesting chromedriver for browser version: {browser_version}')
+                try:
+                    # webdriver-manager changed its constructor signature in some
+                    # versions. Try to call with 'version' first, otherwise fall
+                    # back to the no-arg constructor and rely on the returned
+                    # path from install().
+                    try:
+                        if browser_version:
                             chromedriver_path = ChromeDriverManager(version=browser_version).install()
-                            service = Service(executable_path=chromedriver_path)
-                            logger.info(f'Scraper: Using chromedriver at {chromedriver_path} (matched to browser)')
-                        except Exception:
-                            logger.exception('Scraper: webdriver-manager failed to install matching chromedriver; falling back to default')
+                        else:
                             chromedriver_path = ChromeDriverManager().install()
-                            service = Service(executable_path=chromedriver_path)
-                            logger.info(f'Scraper: Using chromedriver at {chromedriver_path}')
-                    else:
-                        chromedriver_path = ChromeDriverManager().install()
-                        service = Service(executable_path=chromedriver_path)
-                        logger.info(f'Scraper: Using chromedriver at {chromedriver_path}')
+                    except TypeError:
+                        # Older/newer webdriver-manager may expect no 'version'
+                        # kwarg; try the maker without kwargs and pass a
+                        # matching_version param to install if available.
+                        mgr = ChromeDriverManager()
+                        try:
+                            # try install with matching_version param
+                            if browser_version:
+                                chromedriver_path = mgr.install(matching_version=browser_version)
+                            else:
+                                chromedriver_path = mgr.install()
+                        except TypeError:
+                            # Last resort: call install() without matching
+                            chromedriver_path = mgr.install()
+                    service = Service(executable_path=chromedriver_path)
+                    logger.info(f"Scraper: Using chromedriver at {chromedriver_path}")
+                except Exception:
+                    logger.exception('Scraper: webdriver-manager failed; falling back to PATH for chromedriver')
+                    service = Service()
         except Exception:
-            # Fallback: assume chromedriver is on PATH
-            logger.warning('Scraper: webdriver-manager/system chromedriver detection failed, falling back to PATH for chromedriver')
+            logger.warning('Scraper: chromedriver detection failed; falling back to PATH')
             service = Service()
 
         _assert_not_stopped()
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+
+        # On developer Windows machines, an already-running Chrome process can cause the driver
+        # to attach to the user's browser (opening a normal tab). If the user explicitly requests
+        # headless mode (HEADLESS=true) allow the scraper to proceed; otherwise abort with a helpful
+        # message so the user can either close Chrome or set HEADLESS=true.
+        # Allow a forced UI override (risky) via env FORCE_UI=true to bypass this check
+        force_ui = os.getenv('FORCE_UI', '').lower() in ('1', 'true', 'yes')
+        logger.info('Scraper: headless_env=%s force_ui=%s', headless_env, force_ui)
+        if not headless_env and is_chrome_running_on_windows() and not force_ui:
+            msg = 'Chrome is currently running on this machine. Close Chrome or set HEADLESS=true to run the scraper.'
+            logger.error('Scraper: ' + msg)
+            scraper_status['progress'] = msg
+            scraper_status['is_running'] = False
+            return
+        if force_ui:
+            logger.warning('Scraper: FORCE_UI enabled - attempting visible UI run despite running Chrome (may attach to existing profile)')
+
+        # Helper to create a fresh webdriver instance
+        def create_driver():
+            try:
+                _assert_not_stopped()
+                drv = webdriver.Chrome(service=service, options=chrome_options)
+                logger.info('Scraper: New WebDriver instance created, session id=%s', getattr(drv, 'session_id', None))
+                return drv
+            except Exception:
+                logger.exception('Scraper: Failed to create WebDriver')
+                raise
+
+        # Helper to perform login steps into LinkedIn on a given driver instance
+        def do_login(drv):
+            try:
+                _assert_not_stopped()
+                drv.get('https://www.linkedin.com/login')
+                time.sleep(2)
+                retry_on_stale(lambda: drv.find_element(By.ID, 'username').clear())
+                retry_on_stale(lambda: drv.find_element(By.ID, 'username').send_keys(linkedin_user))
+                retry_on_stale(lambda: drv.find_element(By.ID, 'password').clear())
+                retry_on_stale(lambda: drv.find_element(By.ID, 'password').send_keys(linkedin_pass))
+                retry_on_stale(lambda: drv.find_element(By.XPATH, '//*[@type="submit"]').click())
+                time.sleep(5)
+            except Exception:
+                logger.exception('Scraper: Exception during login')
+                raise
+
+        # Safe get helper: tries driver.get and recreates driver+login on invalid session
+        def safe_get(drv, url, attempts=2):
+            for attempt in range(attempts):
+                try:
+                    _assert_not_stopped()
+                    drv.get(url)
+                    return drv
+                except Exception as e:
+                    # If session invalid, try to recreate and re-login
+                    from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
+                    if isinstance(e, InvalidSessionIdException) or 'invalid session id' in str(e).lower() or isinstance(e, WebDriverException):
+                        logger.warning('Scraper: Detected invalid webdriver session; attempting to recreate (attempt %s/%s)', attempt+1, attempts)
+                        try:
+                            try:
+                                drv.quit()
+                            except Exception:
+                                pass
+                            drv = create_driver()
+                            do_login(drv)
+                            continue
+                        except Exception:
+                            logger.exception('Scraper: Failed to recreate driver during safe_get')
+                            raise
+                    else:
+                        raise
+            # If we exit loop, raise
+            raise RuntimeError('safe_get: failed to load url after retries')
+
+        driver = create_driver()
+        # Some ChromeDriver/Chrome combinations open an extra initial blank tab
+        # (about:blank or data:,). Give Chrome a short moment to populate handles
+        # and then close any truly empty startup tabs so the user sees the real
+        # controlled tab. Be conservative to avoid closing legitimate pages.
+        try:
+            time.sleep(0.35)
+            handles = list(driver.window_handles)
+            if len(handles) > 1:
+                for h in list(handles):
+                    try:
+                        driver.switch_to.window(h)
+                        cur = (driver.current_url or '').strip()
+                    except Exception:
+                        cur = ''
+                    if not cur or cur in ('about:blank', 'data:,'):
+                        logger.info('Scraper: Closing empty startup tab (url=%s)', cur)
+                        try:
+                            driver.close()
+                        except Exception:
+                            pass
+                # Switch to first remaining window if any
+                try:
+                    remaining = driver.window_handles
+                    if remaining:
+                        try:
+                            driver.switch_to.window(remaining[0])
+                        except Exception:
+                            logger.debug('Scraper: failed switching to first window handle after cleanup')
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # Helper: check for common LinkedIn human verification / checkpoint pages
         def is_human_verification_page(drv):
@@ -858,16 +1034,8 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
         scraper_status['progress'] = 'Logging into LinkedIn...'
         logger.info('Scraper: Logging into LinkedIn...')
         _assert_not_stopped()
-        driver.get("https://www.linkedin.com/login")
-        time.sleep(2)
-        _assert_not_stopped()
-        # Use retry helper for fields/clicks to avoid transient stale element errors
-        retry_on_stale(lambda: driver.find_element(By.ID, "username").clear())
-        retry_on_stale(lambda: driver.find_element(By.ID, "username").send_keys(linkedin_user))
-        retry_on_stale(lambda: driver.find_element(By.ID, "password").clear())
-        retry_on_stale(lambda: driver.find_element(By.ID, "password").send_keys(linkedin_pass))
-        retry_on_stale(lambda: driver.find_element(By.XPATH, '//*[@type="submit"]').click())
-        time.sleep(5) # Wait for login and redirect
+        # Perform initial login using the helper (will raise on failure)
+        do_login(driver)
 
         # After login, detect if LinkedIn has challenged with human verification.
         # If so, pause the scraper and wait until the verification page clears, then auto-resume.
@@ -881,6 +1049,11 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
 
             # Save artifacts
             ss_path, html_path = _save_artifacts(driver, token)
+            # Log token and artifact locations so admins can find them in logs
+            try:
+                logger.info(f"Scraper: Paused token={token}; screenshot={ss_path}; html={html_path}")
+            except Exception:
+                pass
 
             # Store paused session metadata (we do NOT keep the raw driver in paused_sessions to avoid pickling issues across process restarts)
             # Keep an in-memory reference to the driver so the OTP handler can inject it.
@@ -1374,7 +1547,7 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                 logger.info(scraper_status['progress'])
                 try:
                     _assert_not_stopped()
-                    driver.get(search_url)
+                    driver = safe_get(driver, search_url)
                     time.sleep(3)
                     # One-shot Sort by → Latest (visual confirmation; no loops)
                     try:
@@ -1512,7 +1685,7 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
             _assert_not_stopped()
             scraper_status['progress'] = f"Scraping group: {group['name']}..."
             logger.info(f"Scraper: Scraping group: {group['name']}...")
-            driver.get(group['url'])
+            driver = safe_get(driver, group['url'])
             time.sleep(4)
 
             # Scroll to load more posts
@@ -1532,16 +1705,14 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
             for post in posts:
                 _assert_not_stopped()
                 # Try to expand the post if there's a 'See more' button/link so we get full text
-                    try:
-                        see_more_buttons = post.find_elements(By.XPATH, ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'see more')]")
-                        for b in see_more_buttons:
-                            try:
-                                retry_on_stale(lambda b=b: b.click())
-                                time.sleep(0.2)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                try:
+                    see_more_buttons = post.find_elements(By.XPATH, ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'see more')]")
+                    for b in see_more_buttons:
+                        try:
+                            retry_on_stale(lambda b=b: b.click())
+                            time.sleep(0.2)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 

@@ -240,7 +240,20 @@
                         extractedCount.textContent = 'Count: ' + (data.extracted_emails_count || 0);
                     }
 
-                    if (data.is_running) {
+                    if (data.paused_for_human_verification) {
+                        // Show an explicit paused message so users don't think the scraper is still searching
+                        document.getElementById('statusMain').textContent = 'Status: Paused - awaiting human verification (OTP)';
+                        submitBtn.disabled = true;
+                        stopBtn.disabled = false;
+                        submitBtn.textContent = 'Scraper Paused';
+                        // If the API exposes a short job hint or token, display it (best-effort)
+                        try {
+                            if (data.paused_token) {
+                                const tokenEl = document.getElementById('pausedToken');
+                                if (tokenEl) tokenEl.textContent = data.paused_token;
+                            }
+                        } catch (e) {}
+                    } else if (data.is_running) {
                         submitBtn.disabled = true;
                         stopBtn.disabled = false;
                         submitBtn.textContent = 'Scraping in Progress...';
