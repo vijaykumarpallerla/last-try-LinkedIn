@@ -426,6 +426,42 @@ def _save_artifacts(driver, token: str):
             pass
     return ss_path, html_path
 
+
+def _save_live_screenshot(driver):
+    """Save a single live screenshot and gzipped HTML to a known path for UI live view.
+
+    This writes to data/live.png and data/live.html.gz (overwriting previous).
+    Returns (png_path, html_path) or (None, None) on failure.
+    """
+    try:
+        png = os.path.join('data', 'live.png')
+        htmlp = os.path.join('data', 'live.html.gz')
+        _ensure_dir(png)
+        _ensure_dir(htmlp)
+        try:
+            driver.save_screenshot(png)
+        except Exception:
+            try:
+                b64 = driver.get_screenshot_as_base64()
+                with open(png, 'wb') as f:
+                    f.write(base64.b64decode(b64))
+            except Exception:
+                return None, None
+        try:
+            page = driver.page_source or ''
+            with gzip.open(htmlp, 'wt', encoding='utf-8') as gz:
+                gz.write(page)
+        except Exception:
+            try:
+                with gzip.open(htmlp, 'wt', encoding='utf-8') as gz:
+                    gz.write('')
+            except Exception:
+                pass
+        return png, htmlp
+    except Exception:
+        logger.exception('Failed saving live screenshot')
+        return None, None
+
 def _send_email_simple(to_addrs: list | str, subject: str, body: str, attachments: list = None):
     # Simple SMTP send using GMAIL_USER/GMAIL_PASS or SMTP_* env vars
     gmail_user = os.getenv('GMAIL_USER')
@@ -960,6 +996,11 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
             raise RuntimeError('safe_get: failed to load url after retries')
 
         driver = create_driver()
+        # Save an initial live screenshot so the UI can show something
+        try:
+            _save_live_screenshot(driver)
+        except Exception:
+            pass
         # Some ChromeDriver/Chrome combinations open an extra initial blank tab
         # (about:blank or data:,). Give Chrome a short moment to populate handles
         # and then close any truly empty startup tabs so the user sees the real
@@ -1036,6 +1077,11 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
         _assert_not_stopped()
         # Perform initial login using the helper (will raise on failure)
         do_login(driver)
+        # capture screenshot after login for live view
+        try:
+            _save_live_screenshot(driver)
+        except Exception:
+            pass
 
         # After login, detect if LinkedIn has challenged with human verification.
         # If so, pause the scraper and wait until the verification page clears, then auto-resume.
@@ -1564,6 +1610,11 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                             if stop_event.is_set():
                                 _assert_not_stopped()
                             time.sleep(0.1)
+                        # Update live screenshot after scrolling
+                        try:
+                            _save_live_screenshot(driver)
+                        except Exception:
+                            pass
 
                     # Collect post containers (try multiple selectors)
                     posts = []
@@ -1697,6 +1748,11 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                     if stop_event.is_set():
                         _assert_not_stopped()
                     time.sleep(0.1)
+                # Update live screenshot after scrolling
+                try:
+                    _save_live_screenshot(driver)
+                except Exception:
+                    pass
 
             posts = driver.find_elements(By.CSS_SELECTOR, ".feed-shared-update-v2")
             logger.info(f"Scraper: Found {len(posts)} raw post elements in group '{group['name']}'")
@@ -2408,6 +2464,19 @@ def status():
     except Exception:
         report['stop_requested'] = False
     return jsonify(report)
+
+
+@app.route('/screenshot/latest')
+def latest_screenshot():
+    """Return the latest live screenshot (data/live.png) if available."""
+    p = os.path.join('data', 'live.png')
+    if not os.path.exists(p):
+        return jsonify({'ok': False, 'error': 'no-screenshot'}), 404
+    try:
+        return send_file(p, mimetype='image/png')
+    except Exception:
+        logger.exception('Failed to serve latest screenshot')
+        return jsonify({'ok': False, 'error': 'failed'}), 500
 
 
 @app.route('/stop', methods=['POST'])

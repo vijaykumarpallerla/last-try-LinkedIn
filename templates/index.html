@@ -148,6 +148,13 @@
                     <div id="lastSummary" style="margin-top:8px; font-size:0.9em;"></div>
                         <div id="aiSummary" style="margin-top:8px; font-size:0.9em;"></div>
                 </div>
+                <div id="liveView" class="mt-3" style="display:none;">
+                    <h6 class="text-primary">Live View</h6>
+                    <div style="border:1px solid #ddd; padding:8px; background:white; text-align:center;">
+                        <img id="liveImg" src="/screenshot/latest" alt="Live screenshot" style="max-width:100%; height:auto;" />
+                    </div>
+                    <div class="form-text mt-2">This shows a periodic screenshot of the browser used for scraping. Use it to monitor progress or enter OTP when paused.</div>
+                </div>
                 <div class="mt-3">
                     <button id="backupBtn" class="btn btn-sm btn-secondary">Backup DB</button>
                     <span id="backupMsg" style="margin-left:8px;"></span>
@@ -240,6 +247,8 @@
                         extractedCount.textContent = 'Count: ' + (data.extracted_emails_count || 0);
                     }
 
+                    const liveView = document.getElementById('liveView');
+                    const liveImg = document.getElementById('liveImg');
                     if (data.paused_for_human_verification) {
                         // Show an explicit paused message so users don't think the scraper is still searching
                         document.getElementById('statusMain').textContent = 'Status: Paused - awaiting human verification (OTP)';
@@ -253,7 +262,13 @@
                                 if (tokenEl) tokenEl.textContent = data.paused_token;
                             }
                         } catch (e) {}
+                        // Show live view and refresh snapshot
+                        if (liveView) liveView.style.display = '';
+                        if (liveImg) liveImg.src = '/screenshot/latest?_=' + Date.now();
                     } else if (data.is_running) {
+                        // Show live view and refresh snapshot while running
+                        if (liveView) liveView.style.display = '';
+                        if (liveImg) liveImg.src = '/screenshot/latest?_=' + Date.now();
                         submitBtn.disabled = true;
                         stopBtn.disabled = false;
                         submitBtn.textContent = 'Scraping in Progress...';
@@ -261,6 +276,8 @@
                         submitBtn.disabled = false;
                         stopBtn.disabled = true;
                         submitBtn.textContent = 'Start Scraping';
+                        // hide live view when idle
+                        if (liveView) liveView.style.display = 'none';
                     }
                 })
                 .catch(error => {
