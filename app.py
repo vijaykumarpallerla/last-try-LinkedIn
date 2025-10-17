@@ -757,14 +757,28 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
             scraper_status['is_running'] = False
             return
 
-        # Use webdriver-manager to automatically download/locate chromedriver
+        # Prefer a system-installed chromedriver (from package manager) if present and executable.
+        # This often matches the installed Chromium package on the system and avoids version mismatch.
         try:
-            chromedriver_path = ChromeDriverManager().install()
-            service = Service(executable_path=chromedriver_path)
-            logger.info(f'Scraper: Using chromedriver at {chromedriver_path}')
+            system_cd = shutil.which('chromedriver') or '/usr/bin/chromedriver'
+            if system_cd and os.path.exists(system_cd) and os.access(system_cd, os.X_OK):
+                chromedriver_path = system_cd
+                service = Service(executable_path=chromedriver_path)
+                logger.info(f'Scraper: Using system chromedriver at {chromedriver_path}')
+                try:
+                    out = os.popen(f'"{chromedriver_path}" --version').read().strip()
+                    if out:
+                        logger.info(f'Scraper: chromedriver version: {out}')
+                except Exception:
+                    pass
+            else:
+                # Use webdriver-manager to automatically download/locate chromedriver matching installed browser
+                chromedriver_path = ChromeDriverManager().install()
+                service = Service(executable_path=chromedriver_path)
+                logger.info(f'Scraper: Using chromedriver at {chromedriver_path}')
         except Exception:
             # Fallback: assume chromedriver is on PATH
-            logger.warning('Scraper: webdriver-manager failed, falling back to PATH for chromedriver')
+            logger.warning('Scraper: webdriver-manager/system chromedriver detection failed, falling back to PATH for chromedriver')
             service = Service()
 
         _assert_not_stopped()
