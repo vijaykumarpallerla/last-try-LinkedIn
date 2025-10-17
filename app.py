@@ -647,10 +647,32 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
         scraper_status['progress'] = 'Setting up browser...'
         logger.info('Scraper: Setting up browser...')
         chrome_options = Options()
-        # Comment out the line below to see the browser in action
-        # chrome_options.add_argument("--headless")
+        # When running in a container/headless environment we need several flags so
+        # Chromium can start reliably (Render, Docker, CI). Allow override via HEADLESS env.
+        headless_env = os.getenv('HEADLESS', 'true').lower() in ('1', 'true', 'yes')
+        if headless_env:
+            # Newer Chrome supports --headless=new; fallback to --headless
+            try:
+                chrome_options.add_argument("--headless=new")
+            except Exception:
+                chrome_options.add_argument("--headless")
+        # Required/safe flags for containerized Chrome
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-software-rasterizer")
+        chrome_options.add_argument("--remote-debugging-port=9222")
+        chrome_options.add_argument("--window-size=1920,1080")
+        # Some platforms benefit from this to avoid zygote permission issues
+        chrome_options.add_argument("--no-zygote")
+        chrome_options.add_argument("--single-process")
+        # Reduce automation flags noise
+        try:
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+        except Exception:
+            pass
 
         # Try to find Chrome/Chromium binary. Prefer an explicit env var, then common Linux and Windows paths.
         chrome_bin_env = os.getenv('CHROME_BIN') or os.getenv('GOOGLE_CHROME_BIN') or os.getenv('CHROME_PATH')
