@@ -26,6 +26,7 @@ import requests
 import difflib
 import gzip
 import base64
+import shutil
 
 # --- CONFIGURATION ---
 SENT_JOBS_FILE = 'sent-jobs.json'
@@ -651,26 +652,83 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
 
-        # Try to find Chrome binary in common Windows locations (helps when Chrome isn't on PATH)
-        chrome_paths = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe")
-        ]
+        # Try to find Chrome/Chromium binary. Prefer an explicit env var, then common Linux and Windows paths.
+        chrome_bin_env = os.getenv('CHROME_BIN') or os.getenv('GOOGLE_CHROME_BIN') or os.getenv('CHROME_PATH')
         chrome_found = False
-        for p in chrome_paths:
-            if os.path.exists(p):
-                chrome_options.binary_location = p
-                logger.info(f"Scraper: Found Chrome binary at {p}")
-                chrome_found = True
-                break
+        tried_candidates = []
+        if chrome_bin_env:
+            tried_candidates.append(('env', chrome_bin_env))
+            # Sometimes the env var may point to a symlink or non-exact path; try shutil.which on the basename too
+            try:
+                if os.path.exists(chrome_bin_env) or os.access(chrome_bin_env, os.X_OK):
+                    chrome_options.binary_location = chrome_bin_env
+                    logger.info(f"Scraper: Using CHROME_BIN from env: {chrome_bin_env}")
+                    chrome_found = True
+                else:
+                    # try resolving by name
+                    bn = os.path.basename(chrome_bin_env)
+                    resolved = shutil.which(bn) or ''
+                    if resolved and os.path.exists(resolved):
+                        chrome_options.binary_location = resolved
+                        logger.info(f"Scraper: Resolved CHROME_BIN name '{bn}' to {resolved}")
+                        chrome_found = True
+                    else:
+                        logger.info(f"Scraper: CHROME_BIN env set to '{chrome_bin_env}' but file not found or not executable")
+            except Exception:
+                logger.exception('Error while evaluating CHROME_BIN')
+
+        # Platform-agnostic lookups (Linux-first, then Windows). Use shutil.which where possible.
+        if not chrome_found:
+            # Common linux binary names and explicit paths (keep order of preference)
+            linux_candidates = [
+                shutil.which('google-chrome-stable') or '',
+                shutil.which('google-chrome') or '',
+                shutil.which('chromium-browser') or '',
+                shutil.which('chromium') or '',
+                '/usr/bin/google-chrome',
+                '/usr/bin/chromium-browser',
+                '/usr/bin/chromium',
+                '/snap/bin/chromium'
+            ]
+            for p in linux_candidates:
+                if not p:
+                    continue
+                tried_candidates.append(('candidate', p))
+                try:
+                    if os.path.exists(p) and os.access(p, os.X_OK):
+                        chrome_options.binary_location = p
+                        logger.info(f"Scraper: Found Chrome/Chromium binary at {p}")
+                        chrome_found = True
+                        break
+                except Exception:
+                    logger.exception(f'Error while checking candidate path: {p}')
+
+        # If still not found, log what we tried to help diagnostics
+        if not chrome_found:
+            try:
+                logger.info('Scraper: Chrome detection tried the following candidates: %s', tried_candidates)
+            except Exception:
+                pass
+
+        # Fall back to checking common Windows locations (for local Windows dev)
+        if not chrome_found:
+            chrome_paths = [
+                r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                r"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+                os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe")
+            ]
+            for p in chrome_paths:
+                if os.path.exists(p):
+                    chrome_options.binary_location = p
+                    logger.info(f"Scraper: Found Chrome binary at {p}")
+                    chrome_found = True
+                    break
 
         if not chrome_found:
             # Give a clear message both in terminal and UI status
             msg = (
-                "Chrome browser binary not found. Please install Google Chrome or set the path to your "
-                "chrome.exe in the code (chrome_options.binary_location). Common Windows paths are: "
-                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe or your user AppData path."
+                "Chrome/Chromium browser binary not found. Please install Google Chrome/Chromium or set the path via the CHROME_BIN env var. "
+                "On Linux, common paths are /usr/bin/google-chrome or /usr/bin/chromium-browser."
             )
             logger.error('Scraper: ' + msg)
             scraper_status['progress'] = msg
