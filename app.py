@@ -18,6 +18,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime, timedelta
 import re
+from selenium.common.exceptions import StaleElementReferenceException, ElementClickInterceptedException, NoSuchElementException
 import hashlib
 import tempfile
 import uuid
@@ -803,17 +804,38 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                 return True
             return False
 
+        # Utility to retry an action if the page updates and elements become stale.
+        def retry_on_stale(fn, attempts: int = 3, delay: float = 0.4):
+            last_exc = None
+            for i in range(attempts):
+                try:
+                    return fn()
+                except StaleElementReferenceException as e:
+                    last_exc = e
+                    time.sleep(delay)
+                except ElementClickInterceptedException as e:
+                    # transient overlay, wait and retry
+                    last_exc = e
+                    time.sleep(delay)
+            # If we get here, re-raise the last exception for visibility
+            if last_exc:
+                raise last_exc
+            return None
+
         # --- LinkedIn Login ---
         scraper_status['progress'] = 'Logging into LinkedIn...'
         logger.info('Scraper: Logging into LinkedIn...')
         _assert_not_stopped()
-        driver.get("https://www.linkedin.com/login")
-        time.sleep(2)
-        _assert_not_stopped()
-        driver.find_element(By.ID, "username").send_keys(linkedin_user)
-        driver.find_element(By.ID, "password").send_keys(linkedin_pass)
-        driver.find_element(By.XPATH, '//*[@type="submit"]').click()
-        time.sleep(5) # Wait for login and redirect
+    driver.get("https://www.linkedin.com/login")
+    time.sleep(2)
+    _assert_not_stopped()
+    # Use retry helper for fields/clicks to avoid transient stale element errors
+    retry_on_stale(lambda: driver.find_element(By.ID, "username").clear())
+    retry_on_stale(lambda: driver.find_element(By.ID, "username").send_keys(linkedin_user))
+    retry_on_stale(lambda: driver.find_element(By.ID, "password").clear())
+    retry_on_stale(lambda: driver.find_element(By.ID, "password").send_keys(linkedin_pass))
+    retry_on_stale(lambda: driver.find_element(By.XPATH, '//*[@type="submit"]').click())
+    time.sleep(5) # Wait for login and redirect
 
         # After login, detect if LinkedIn has challenged with human verification.
         # If so, pause the scraper and wait until the verification page clears, then auto-resume.
@@ -1359,7 +1381,8 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                             more_buttons = post.find_elements(By.XPATH, ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'see more') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'more')]")
                             for b in more_buttons[:2]:
                                 try:
-                                    b.click(); time.sleep(0.1)
+                                    retry_on_stale(lambda b=b: b.click())
+                                    time.sleep(0.1)
                                 except Exception:
                                     pass
                         except Exception:
@@ -1477,14 +1500,16 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
             for post in posts:
                 _assert_not_stopped()
                 # Try to expand the post if there's a 'See more' button/link so we get full text
-                try:
-                    see_more_buttons = post.find_elements(By.XPATH, ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'see more')]")
-                    for b in see_more_buttons:
-                        try:
-                            b.click()
-                            time.sleep(0.2)
-                        except Exception:
-                            pass
+                    try:
+                        see_more_buttons = post.find_elements(By.XPATH, ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'see more')]")
+                        for b in see_more_buttons:
+                            try:
+                                retry_on_stale(lambda b=b: b.click())
+                                time.sleep(0.2)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
