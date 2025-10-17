@@ -858,16 +858,16 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
         scraper_status['progress'] = 'Logging into LinkedIn...'
         logger.info('Scraper: Logging into LinkedIn...')
         _assert_not_stopped()
-    driver.get("https://www.linkedin.com/login")
-    time.sleep(2)
-    _assert_not_stopped()
-    # Use retry helper for fields/clicks to avoid transient stale element errors
-    retry_on_stale(lambda: driver.find_element(By.ID, "username").clear())
-    retry_on_stale(lambda: driver.find_element(By.ID, "username").send_keys(linkedin_user))
-    retry_on_stale(lambda: driver.find_element(By.ID, "password").clear())
-    retry_on_stale(lambda: driver.find_element(By.ID, "password").send_keys(linkedin_pass))
-    retry_on_stale(lambda: driver.find_element(By.XPATH, '//*[@type="submit"]').click())
-    time.sleep(5) # Wait for login and redirect
+        driver.get("https://www.linkedin.com/login")
+        time.sleep(2)
+        _assert_not_stopped()
+        # Use retry helper for fields/clicks to avoid transient stale element errors
+        retry_on_stale(lambda: driver.find_element(By.ID, "username").clear())
+        retry_on_stale(lambda: driver.find_element(By.ID, "username").send_keys(linkedin_user))
+        retry_on_stale(lambda: driver.find_element(By.ID, "password").clear())
+        retry_on_stale(lambda: driver.find_element(By.ID, "password").send_keys(linkedin_pass))
+        retry_on_stale(lambda: driver.find_element(By.XPATH, '//*[@type="submit"]').click())
+        time.sleep(5) # Wait for login and redirect
 
         # After login, detect if LinkedIn has challenged with human verification.
         # If so, pause the scraper and wait until the verification page clears, then auto-resume.
