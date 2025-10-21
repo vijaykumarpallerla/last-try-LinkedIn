@@ -42,10 +42,10 @@ RUN mkdir -p /opt/novnc && \
     curl -fsSL https://github.com/novnc/noVNC/archive/refs/heads/master.zip -o /tmp/novnc.zip \
     && apt-get update && apt-get install -y unzip && unzip /tmp/novnc.zip -d /opt && mv /opt/noVNC-master /opt/novnc && rm /tmp/novnc.zip
 
+
 # Copy nginx and supervisord confs
 COPY deploy/nginx.conf /etc/nginx/nginx.conf
 COPY deploy/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-RUN mkdir -p /var/log/supervisord
 
 # Expose nothing explicitly (Render provides $PORT). For local testing we expose ports too:
 EXPOSE 8080 6081 6901 5900
@@ -56,3 +56,4 @@ USER appuser
 ENTRYPOINT ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
 
 WORKDIR /home/appuser/app
+RUN mkdir -p /home/appuser/logs && chown -R appuser:appuser /home/appuser/logs
