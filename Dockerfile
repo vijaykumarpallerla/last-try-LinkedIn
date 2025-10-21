@@ -14,14 +14,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git build-essential libnss3 libatk-bridge2.0-0 libgtk-3-0 libxss1 libasound2 libx11-xcb1 \
  && rm -rf /var/lib/apt/lists/*
 
-# Install Node (for noVNC web tools install step) - optional; we'll fetch noVNC directly
-# Install Chrome for Testing (or stable chrome). Using Chrome for Testing binaries:
-RUN mkdir -p /opt/chrome && \
-    curl -fsSL "https://edgedl.me.gvt1.com/edgedl/chrome/chrome-for-testing/114.0.5735.110/linux64/chrome-linux64.zip" -o /tmp/chrome.zip \
-    && apt-get update && apt-get install -y unzip \
-    && unzip /tmp/chrome.zip -d /opt/chrome && rm /tmp/chrome.zip
-
-ENV CHROME_BIN=/opt/chrome/chrome-linux64/chrome
+# Install Google Chrome stable
+RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - && \
+    echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list && \
+    apt-get update && \
+    apt-get install -y google-chrome-stable
+ENV CHROME_BIN=/usr/bin/google-chrome
 
 # Install chromedriver (Chrome for Testing matching driver)
 RUN mkdir -p /opt/chromedriver && \
