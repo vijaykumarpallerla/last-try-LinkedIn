@@ -50,4 +50,3 @@ COPY deploy/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 # Expose nothing explicitly (Render provides $PORT). For local testing we expose ports too:
 EXPOSE 8080 6081 6901 5900
 
-USER appuser
