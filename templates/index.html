@@ -148,18 +148,38 @@
                     <div id="lastSummary" style="margin-top:8px; font-size:0.9em;"></div>
                         <div id="aiSummary" style="margin-top:8px; font-size:0.9em;"></div>
                 </div>
-                <div id="liveView" class="mt-3" style="display:none;">
-                    <h6 class="text-primary">Live View</h6>
+                <!-- If WEBSOCKIFY_URL is configured we show the embedded noVNC client; otherwise show instructions and keep remote controls -->
+                <div id="liveView" class="mt-3">
+                    <h6 class="text-primary">Live Browser (interactive)</h6>
                     <div style="border:1px solid #ddd; padding:8px; background:white; text-align:center;">
-                        <img id="liveImg" src="/screenshot/latest" alt="Live screenshot" style="max-width:100%; height:auto;" />
+                        {% if env.WEBSOCKIFY_URL %}
+                        <div style="width:100%;height:480px;">
+                            <iframe id="liveVncFrame" src="{{ env.WEBSOCKIFY_URL }}" style="width:100%;height:100%;border:0;background:#000"></iframe>
+                        </div>
+                        {% else %}
+                        <div style="padding:16px;">noVNC not configured. To enable interactive control, run a VNC server and websockify/noVNC and set <code>WEBSOCKIFY_URL</code> in your <code>.env</code>.</div>
+                        {% endif %}
                     </div>
-                    <div class="form-text mt-2">This shows a periodic screenshot of the browser used for scraping. Use it to monitor progress or enter OTP when paused.</div>
+                    <div style="margin-top:8px; display:flex; gap:8px; align-items:center; justify-content:center;">
+                        <a id="openVncDirect" href="/vnc/" target="_blank" class="btn btn-sm btn-outline-secondary">Open /vnc/</a>
+                    </div>
+                    <div class="form-text mt-2">If interactive VNC is available you can click and type directly inside the embedded browser. Otherwise use the remote-control actions below for paused sessions.</div>
                     <div id="remoteControls" style="margin-top:8px; display:flex; gap:8px; align-items:center; justify-content:center;">
-                        <input id="remoteText" placeholder="Type text here to send to focused field" style="min-width:260px;" />
+                        <input id="remoteText" placeholder="Type text here to send to focused field (paused session)" style="min-width:260px;" />
                         <button id="sendTextBtn" class="btn btn-sm btn-primary">Send Text</button>
                         <button id="enterKeyBtn" class="btn btn-sm btn-secondary">Enter</button>
                         <button id="tabKeyBtn" class="btn btn-sm btn-secondary">Tab</button>
                         <button id="escKeyBtn" class="btn btn-sm btn-secondary">Esc</button>
+                    </div>
+                </div>
+                <!-- Embedded VNC panel (hidden by default) -->
+                <div id="vncPanel" style="display:none; margin-top:12px; border:1px solid #ddd; background:white;">
+                    <div style="padding:6px; background:#f8f9fa; border-bottom:1px solid #e9ecef;">
+                        <strong>Embedded Live Browser</strong>
+                        <button id="closeVncEmbed" class="btn btn-sm btn-outline-secondary" style="float:right;">Close</button>
+                    </div>
+                    <div style="height:600px;">
+                        <iframe id="vncFrame" src="/vnc/" style="width:100%; height:100%; border:0; background:#000"></iframe>
                     </div>
                 </div>
                 <div id="pausedLinkBox" class="mt-2" style="display:none;">
@@ -282,7 +302,8 @@
                         } catch (e) {}
                         // Show live view and refresh snapshot
                         if (liveView) liveView.style.display = '';
-                        if (liveImg) liveImg.src = '/screenshot/latest?_=' + Date.now();
+                        // store paused token so remote controls can use it
+                        if (data.paused_token) currentPausedToken = data.paused_token;
                         // Show public paused link if provided
                         try {
                             if (data.paused_submit_url) {
@@ -310,7 +331,7 @@
                     } else if (data.is_running) {
                         // Show live view and refresh snapshot while running
                         if (liveView) liveView.style.display = '';
-                        if (liveImg) liveImg.src = '/screenshot/latest?_=' + Date.now();
+                        if (data.paused_token) currentPausedToken = data.paused_token;
                         submitBtn.disabled = true;
                         stopBtn.disabled = false;
                         submitBtn.textContent = 'Scraping in Progress...';
@@ -318,8 +339,17 @@
                         submitBtn.disabled = false;
                         stopBtn.disabled = true;
                         submitBtn.textContent = 'Start Scraping';
-                        // hide live view when idle
-                        if (liveView) liveView.style.display = 'none';
+                        // hide live view when idle unless WEBSOCKIFY_URL is present (still show embedded client)
+                        try {
+                            const ws = '{{ env.WEBSOCKIFY_URL or "" }}';
+                            if (!ws) {
+                                if (liveView) liveView.style.display = 'none';
+                            } else {
+                                if (liveView) liveView.style.display = '';
+                            }
+                        } catch (e) {
+                            if (liveView) liveView.style.display = 'none';
+                        }
                     }
                 })
                 .catch(error => {
@@ -635,55 +665,11 @@
         const tabKeyBtn = document.getElementById('tabKeyBtn');
         const escKeyBtn = document.getElementById('escKeyBtn');
 
-        // Update currentPausedToken from checkStatus responses
-        const orig_checkStatus = checkStatus;
-        async function checkStatus() {
-            try {
-                const res = await fetch('/status');
-                const data = await res.json();
-                // preserve previous behavior by calling the in-file status processor
-                // (we replicate minimal updates here instead of reusing the earlier promise chain)
-                document.getElementById('statusMain').textContent = 'Status: ' + data.progress;
-                if (data.paused_for_human_verification && data.paused_token) {
-                    currentPausedToken = data.paused_token;
-                } else {
-                    // clear token when not paused
-                    if (!data.paused_for_human_verification) currentPausedToken = null;
-                }
-                // call the original UI update logic by reusing the existing function body above via dispatch
-                // For simplicity, just call the existing chained fetch-based version once more to update the UI
-            } catch (e) {
-                console.error('checkStatus (remote) failed', e);
-            }
-        }
-        // Override the interval to use our async wrapper
-        clearInterval();
+        // Update currentPausedToken from status responses (the main checkStatus above handles UI updates)
+        // currentPausedToken will be set by the main checkStatus when the server reports a paused session.
 
-        // Click handler on the live image: compute normalized coords
-        if (liveImg) {
-            liveImg.addEventListener('click', async (ev) => {
-                if (!currentPausedToken) return alert('No paused session token available. Open the paused link to trigger a paused session.');
-                try {
-                    const rect = liveImg.getBoundingClientRect();
-                    const cx = ev.clientX - rect.left;
-                    const cy = ev.clientY - rect.top;
-                    const nx = cx / rect.width;
-                    const ny = cy / rect.height;
-                    const payload = { token: currentPausedToken, x: nx, y: ny };
-                    const r = await fetch('/api/remote/click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-                    const j = await r.json();
-                    if (!j.ok) {
-                        alert('Remote click failed: ' + (j.error || JSON.stringify(j)));
-                    } else {
-                        // refresh live image to reflect the result
-                        liveImg.src = '/screenshot/latest?_=' + Date.now();
-                    }
-                } catch (e) {
-                    console.error('remote click error', e);
-                    alert('Remote click failed: ' + e.message);
-                }
-            });
-        }
+        // Remote click: exposed via /api/remote/click - callers (embedded VNC) can use token returned from /status
+        // Remote typing and key sending use currentPausedToken from status responses
 
         // Send typed text to paused session
         if (sendTextBtn) {
@@ -694,7 +680,7 @@
                 try {
                     const res = await fetch('/api/remote/type', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: currentPausedToken, text }) });
                     const d = await res.json();
-                    if (!d.ok) alert('Type failed: ' + (d.error || JSON.stringify(d))); else liveImg.src = '/screenshot/latest?_=' + Date.now();
+                    if (!d.ok) alert('Type failed: ' + (d.error || JSON.stringify(d))); else alert('Text sent');
                 } catch (e) {
                     console.error('send text failed', e);
                     alert('Send text failed');
@@ -702,9 +688,47 @@
             });
         }
 
-        if (enterKeyBtn) enterKeyBtn.addEventListener('click', async () => { if (!currentPausedToken) return alert('No paused session token'); try { const r = await fetch('/api/remote/key', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token: currentPausedToken, key: 'Enter' }) }); const j = await r.json(); if (!j.ok) alert('Key send failed: '+(j.error||JSON.stringify(j))); else liveImg.src = '/screenshot/latest?_=' + Date.now(); } catch(e){alert('Key send error')} });
-        if (tabKeyBtn) tabKeyBtn.addEventListener('click', async () => { if (!currentPausedToken) return alert('No paused session token'); try { const r = await fetch('/api/remote/key', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token: currentPausedToken, key: 'Tab' }) }); const j = await r.json(); if (!j.ok) alert('Key send failed: '+(j.error||JSON.stringify(j))); else liveImg.src = '/screenshot/latest?_=' + Date.now(); } catch(e){alert('Key send error')} });
-        if (escKeyBtn) escKeyBtn.addEventListener('click', async () => { if (!currentPausedToken) return alert('No paused session token'); try { const r = await fetch('/api/remote/key', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token: currentPausedToken, key: 'Escape' }) }); const j = await r.json(); if (!j.ok) alert('Key send failed: '+(j.error||JSON.stringify(j))); else liveImg.src = '/screenshot/latest?_=' + Date.now(); } catch(e){alert('Key send error')} });
+        // Open Live Browser (noVNC) helper button
+        const openLiveBtn = document.getElementById('openLiveBtn');
+        if (openLiveBtn) {
+            openLiveBtn.addEventListener('click', async () => {
+                // Prefer a token-specific VNC path if the server exposes one via /status
+                try {
+                    const res = await fetch('/status');
+                    const data = await res.json();
+                    if (data.paused_submit_url) {
+                        // If a public paused_submit_url is provided, open that in a new tab
+                        window.open(data.paused_submit_url, '_blank');
+                        return;
+                    }
+                } catch (e) {
+                    // ignore
+                }
+                // Fallback to the noVNC path proxied by nginx
+                window.open('/vnc/', '_blank');
+            });
+        }
+
+        const embedLiveBtn = document.getElementById('embedLiveBtn');
+        const vncPanel = document.getElementById('vncPanel');
+        const closeVncEmbed = document.getElementById('closeVncEmbed');
+        if (embedLiveBtn && vncPanel) {
+            embedLiveBtn.addEventListener('click', () => {
+                vncPanel.style.display = '';
+                // ensure iframe refresh
+                const f = document.getElementById('vncFrame');
+                if (f) {
+                    f.src = f.src;
+                }
+            });
+        }
+        if (closeVncEmbed && vncPanel) {
+            closeVncEmbed.addEventListener('click', () => { vncPanel.style.display = 'none'; });
+        }
+
+    if (enterKeyBtn) enterKeyBtn.addEventListener('click', async () => { if (!currentPausedToken) return alert('No paused session token'); try { const r = await fetch('/api/remote/key', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token: currentPausedToken, key: 'Enter' }) }); const j = await r.json(); if (!j.ok) alert('Key send failed: '+(j.error||JSON.stringify(j))); else alert('Key sent'); } catch(e){alert('Key send error')} });
+    if (tabKeyBtn) tabKeyBtn.addEventListener('click', async () => { if (!currentPausedToken) return alert('No paused session token'); try { const r = await fetch('/api/remote/key', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token: currentPausedToken, key: 'Tab' }) }); const j = await r.json(); if (!j.ok) alert('Key send failed: '+(j.error||JSON.stringify(j))); else alert('Key sent'); } catch(e){alert('Key send error')} });
+    if (escKeyBtn) escKeyBtn.addEventListener('click', async () => { if (!currentPausedToken) return alert('No paused session token'); try { const r = await fetch('/api/remote/key', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token: currentPausedToken, key: 'Escape' }) }); const j = await r.json(); if (!j.ok) alert('Key send failed: '+(j.error||JSON.stringify(j))); else alert('Key sent'); } catch(e){alert('Key send error')} });
     </script>
 </body>
 </html>

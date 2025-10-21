@@ -1,0 +1,31 @@
+services:
+  app:
+    build: .
+    image: linkedin-scraper:local
+    environment:
+      - HEADLESS=false
+      - PORT=8080
+      - BASE_URL=http://localhost:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - chrome-debug
+
+  chrome-debug:
+    image: selenium/standalone-chrome-debug:latest
+    shm_size: '2g'
+    ports:
+      - "4444:4444"   # selenium
+      - "6901:6901"   # noVNC web UI
+    environment:
+      - SCREEN_RESOLUTION=1920x1080
+
+  nginx:
+    image: nginx:stable-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - chrome-debug
+      - app

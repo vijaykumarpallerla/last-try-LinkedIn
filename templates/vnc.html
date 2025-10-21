@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Live Browser (noVNC)</title>
+    <style>body{margin:0;font-family:Arial,Helvetica,sans-serif} .note{padding:12px;background:#fff3cd;border:1px solid #ffeeba}</style>
+</head>
+<body>
+    <!-- This page either loads an embedded noVNC client (if WEBSOCKIFY_URL is set) or shows instructions -->
+    {% set ws = env.get('WEBSOCKIFY_URL','') if env is defined else '' %}
+    {% if ws %}
+        <!-- If you provide WEBSOCKIFY_URL environment variable pointing to your websocket proxy (wss://host:port),
+             the noVNC client will attempt to connect. Example: wss://your-host.example.com/websockify -->
+        <div id="noVncContainer" style="width:100%;height:100vh;">
+            <iframe src="{{ ws }}" style="width:100%;height:100%;border:0"></iframe>
+        </div>
+    {% else %}
+        <div style="padding:16px;">
+            <h3>Live Browser / noVNC</h3>
+            <div class="note">noVNC is not configured on this host. To enable live, interactive view, run a VNC server (e.g., Xvfb + x11vnc or TigerVNC) and a WebSocket proxy (websockify) and set the WEBSOCKIFY_URL environment variable to the noVNC client URL or websockify endpoint.</div>
+            <h4>Quick local test (on the server)</h4>
+            <ol>
+                <li>Install a VNC server and start Chrome on the server.</li>
+                <li>Run <code>websockify --web /usr/share/novnc 5901 localhost:5900</code> (adjust paths/ports).</li>
+                <li>Open this page and set <code>WEBSOCKIFY_URL</code> to <code>http(s)://your-host:port/vnc.html?host=...&port=5901</code>.</li>
+            </ol>
+            <p>See <a href="https://novnc.com/info.html" target="_blank">noVNC docs</a> for details.</p>
+        </div>
+    {% endif %}
+</body>
+</html>

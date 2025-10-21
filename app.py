@@ -1581,6 +1581,135 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
             pass
         ai_stats = {'kept': 0, 'skipped': 0, 'errors': 0}
 
+        # --- Scrape Home Feed first ---
+        try:
+            _assert_not_stopped()
+            scraper_status['progress'] = 'Scraping LinkedIn Home Feed...'
+            logger.info('Scraper: Scraping Home Feed')
+            # Load feed
+            driver = safe_get(driver, 'https://www.linkedin.com/feed/')
+            time.sleep(3)
+            # gentle scroll to load recent posts
+            for _ in range(4):
+                _assert_not_stopped()
+                try:
+                    driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
+                except Exception:
+                    pass
+                for __ in range(15):
+                    if stop_event.is_set():
+                        _assert_not_stopped()
+                    time.sleep(0.1)
+                try:
+                    _save_live_screenshot(driver)
+                except Exception:
+                    pass
+
+            posts = []
+            try:
+                posts = driver.find_elements(By.CSS_SELECTOR, ".feed-shared-update-v2")
+            except Exception:
+                posts = []
+            if not posts:
+                try:
+                    posts = driver.find_elements(By.CSS_SELECTOR, "article, .feed-shared-update-v2")
+                except Exception:
+                    posts = []
+            logger.info(f"Scraper: Feed found {len(posts)} post elements")
+            feed_count = 0
+            # limit posts from feed to avoid very long runs
+            try:
+                max_feed = int(os.getenv('MAX_FEED_POSTS') or 50)
+            except Exception:
+                max_feed = 50
+            for post in posts[:max_feed]:
+                _assert_not_stopped()
+                try:
+                    # expand see more
+                    more_buttons = post.find_elements(By.XPATH, ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'see more') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'more')]")
+                    for b in more_buttons[:2]:
+                        try:
+                            retry_on_stale(lambda b=b: b.click())
+                            time.sleep(0.1)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                post_text = ''
+                try:
+                    post_text = post.text or ''
+                except Exception:
+                    post_text = ''
+                if not post_text:
+                    continue
+                if not bool(recent_time_re.search(post_text)):
+                    continue
+
+                # AI filter
+                reason = ''
+                if ai_enabled:
+                    try:
+                        keep, reason = ai_is_usa_hiring_post(post_text)
+                        if keep and is_promo_training(post_text) and not seems_hiring(post_text):
+                            keep = False
+                            reason = (reason or '') + ' | promo-training'
+                        if keep:
+                            bad_loc = is_disallowed_location(post_text)
+                            if bad_loc:
+                                keep = False
+                                reason = (reason or '') + f' | non-usa-location: {bad_loc}'
+                        if not keep:
+                            ai_stats['skipped'] += 1
+                            continue
+                        else:
+                            ai_stats['kept'] += 1
+                    except Exception:
+                        ai_stats['errors'] += 1
+                        continue
+
+                emails, phones = extract_contacts_from_text(post_text)
+                try:
+                    anchors = post.find_elements(By.TAG_NAME, 'a')
+                    stable_id = _extract_linkedin_activity_id_from_anchors(anchors)
+                    for a in anchors:
+                        try:
+                            href = (a.get_attribute('href') or '')
+                            if href.startswith('mailto:'):
+                                addr = href.split(':', 1)[1].split('?')[0]
+                                if addr and addr not in emails:
+                                    emails.append(addr)
+                        except Exception:
+                            pass
+                except Exception:
+                    anchors = []
+                    stable_id = None
+
+                if not stable_id:
+                    stable_id = f"feed:{hashlib.sha256(_normalize_text_for_id(post_text).encode('utf-8')).hexdigest()}"
+
+                all_job_posts.append({
+                    'text': post_text,
+                    'raw_text': post_text,
+                    'emails': emails,
+                    'phones': phones,
+                    'group_name': 'Home Feed',
+                    'group_url': 'https://www.linkedin.com/feed/',
+                    'id': stable_id,
+                    'ai_reason': reason
+                })
+                feed_count += 1
+
+            try:
+                gs = scraper_status.get('groups_summary', [])
+                gs.append({'name': 'Home Feed', 'url': 'https://www.linkedin.com/feed/', 'recent_count': feed_count})
+                scraper_status['groups_summary'] = gs
+                scraper_status['last_found_total'] = len(all_job_posts)
+            except Exception:
+                pass
+        except Exception:
+            logger.exception('Scraper: Error while scraping Home Feed')
+
         if use_keywords_search and kw_list:
             for kw in kw_list:
                 _assert_not_stopped()
@@ -2381,7 +2510,8 @@ def index():
         env = {
             'GMAIL_USER': os.getenv('GMAIL_USER'),
             'RECIPIENTS': recipient_emails,
-            'LINKEDIN_USER': linkedin_user
+            'LINKEDIN_USER': linkedin_user,
+            'WEBSOCKIFY_URL': os.getenv('WEBSOCKIFY_URL') or ''
         }
         return render_template('index.html', started=True, settings=settings, env=env, admin_token=ADMIN_TOKEN)
 
@@ -2395,7 +2525,8 @@ def index():
     env = {
         'GMAIL_USER': os.getenv('GMAIL_USER'),
         'RECIPIENTS': os.getenv('RECIPIENTS'),
-        'LINKEDIN_USER': os.getenv('LINKEDIN_USER')
+        'LINKEDIN_USER': os.getenv('LINKEDIN_USER'),
+        'WEBSOCKIFY_URL': os.getenv('WEBSOCKIFY_URL') or ''
     }
     # Pass ADMIN_TOKEN to the template so client JS can include it in admin requests if present
     return render_template('index.html', settings=settings, env=env, admin_token=ADMIN_TOKEN)
@@ -2539,6 +2670,16 @@ def stop_scraper():
     except Exception:
         logger.exception('Failed to request stop')
         return jsonify({'ok': False, 'error': 'failed to request stop'}), 500
+
+
+@app.route('/vnc/')
+def vnc_page():
+    """Simple page that hosts an embedded noVNC client or shows instructions when not configured."""
+    # Prefer an explicit env variable passed in, else rely on Flask's environment
+    ws = os.getenv('WEBSOCKIFY_URL') or ''
+    # pass env mapping for template to access
+    env = {'WEBSOCKIFY_URL': ws}
+    return render_template('vnc.html', env=env)
 
 
 @app.route('/test-smtp', methods=['GET'])
@@ -3226,5 +3367,5 @@ def api_remote_key():
         logger.exception('api_remote_key error')
         return jsonify({'ok': False, 'error': str(e)}), 500
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

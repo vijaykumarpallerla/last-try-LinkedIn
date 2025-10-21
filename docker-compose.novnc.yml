@@ -1,0 +1,14 @@
+services:
+  novnc:
+    image: dorowu/ubuntu-desktop-lxde-vnc:latest
+    container_name: linkedin-novnc
+    # Set a VNC password (change for production)
+    environment:
+      - VNC_PASSWORD=changeme
+    ports:
+      - "5900:5900"   # VNC port
+      - "6901:6081"   # map host 6901 -> container 6081 (noVNC web UI)
+    volumes:
+      - ./vnc-data:/root/.vnc
+    restart: unless-stopped
+    shm_size: '1gb'

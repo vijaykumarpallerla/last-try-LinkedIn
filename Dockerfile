@@ -1,42 +1,60 @@
-FROM python:3.11-slim
+# Dockerfile.render - single-container for Flask + Chrome (Xvfb) + VNC + noVNC + nginx
+FROM ubuntu:22.04
 
-WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
+# Set default ports used internally
+ENV FLASK_PORT=8080
+ENV NOVNC_PORT=6081
+ENV VNC_PORT=5900
 
-# Install system dependencies and Chromium
+# Install system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-	ca-certificates \
-	wget \
-	gnupg2 \
-	fonts-liberation \
-	libnss3 \
-	libatk-bridge2.0-0 \
-	libgtk-3-0 \
-	libx11-6 \
-	libxss1 \
-	libasound2 \
-	libxrandr2 \
-	libxdamage1 \
-	libgbm1 \
-	xvfb \
-	chromium-driver \
-	chromium \
+    ca-certificates curl gnupg2 apt-transport-https fonts-liberation \
+    wget unzip xvfb x11vnc net-tools supervisor nginx python3 python3-venv python3-pip \
+    git build-essential libnss3 libatk-bridge2.0-0 libgtk-3-0 libxss1 libasound2 libx11-xcb1 \
  && rm -rf /var/lib/apt/lists/*
 
-# Ensure common chromium binary names exist and set CHROME_BIN so the app can find Chromium
-RUN if [ -x /usr/bin/chromium-browser ]; then ln -sf /usr/bin/chromium-browser /usr/bin/chromium; \
-	elif [ -x /usr/bin/chromium ]; then ln -sf /usr/bin/chromium /usr/bin/chromium-browser; fi
-ENV CHROME_BIN=/usr/bin/chromium-browser
-ENV PYTHONUNBUFFERED=1
+# Install Node (for noVNC web tools install step) - optional; we'll fetch noVNC directly
+# Install Chrome for Testing (or stable chrome). Using Chrome for Testing binaries:
+RUN mkdir -p /opt/chrome && \
+    curl -fsSL "https://edgedl.me.gvt1.com/edgedl/chrome/chrome-for-testing/114.0.5735.110/linux64/chrome-linux64.zip" -o /tmp/chrome.zip \
+    && apt-get update && apt-get install -y unzip \
+    && unzip /tmp/chrome.zip -d /opt/chrome && rm /tmp/chrome.zip
 
-# Install Python deps
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+ENV CHROME_BIN=/opt/chrome/chrome-linux64/chrome
 
-# Copy application
-COPY . .
+# Install chromedriver (Chrome for Testing matching driver)
+RUN mkdir -p /opt/chromedriver && \
+    curl -fsSL "https://edgedl.me.gvt1.com/edgedl/chrome/chrome-for-testing/114.0.5735.110/linux64/chromedriver-linux64.zip" -o /tmp/cdriver.zip \
+    && unzip /tmp/cdriver.zip -d /opt/chromedriver && rm /tmp/cdriver.zip && chmod +x /opt/chromedriver/chromedriver
 
-EXPOSE 8000
+ENV PATH="/opt/chromedriver:${PATH}"
 
-# Ensure the start script is executable and use it so we can bind to $PORT provided by Render
-RUN chmod +x ./start.sh || true
-CMD ["./start.sh"]
+# Create app user
+RUN useradd -m -s /bin/bash appuser
+WORKDIR /home/appuser/app
+COPY . /home/appuser/app
+RUN chown -R appuser:appuser /home/appuser/app
+
+# python deps
+RUN python3 -m pip install --upgrade pip
+RUN python3 -m pip install -r requirements.txt
+
+# Install websockify and noVNC client (we'll use upstream noVNC static files)
+RUN python3 -m pip install websockify==0.10.0
+RUN mkdir -p /opt/novnc && \
+    curl -fsSL https://github.com/novnc/noVNC/archive/refs/heads/master.zip -o /tmp/novnc.zip \
+    && apt-get update && apt-get install -y unzip && unzip /tmp/novnc.zip -d /opt && mv /opt/noVNC-master /opt/novnc && rm /tmp/novnc.zip
+
+# Copy nginx and supervisord confs
+COPY deploy/nginx.conf /etc/nginx/nginx.conf
+COPY deploy/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+RUN mkdir -p /var/log/supervisord
+
+# Expose nothing explicitly (Render provides $PORT). For local testing we expose ports too:
+EXPOSE 8080 6081 6901 5900
+
+USER appuser
+
+# Use supervisord to run processes (nginx forwarded by root by supervisord entrypoint)
+ENTRYPOINT ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

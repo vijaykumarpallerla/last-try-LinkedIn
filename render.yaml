@@ -1,0 +1,16 @@
+# render.yaml - optional Render service manifest
+# Replace service.name and repo settings as appropriate for your Render account
+services:
+  - type: web
+    name: linkedin-scraper
+    env: docker
+    repo: <your-github-username>/<your-repo>
+    branch: main
+    dockerfilePath: Dockerfile
+    plan: standard-2x  # adjust for Chrome memory needs
+    envVars:
+      - key: WEBSOCKIFY_URL
+        value: /vnc/vnc.html?host=127.0.0.1&port=5900
+      - key: PORT
+        value: '8080'
+      # Add other secrets via the Render dashboard (GMAIL_USER, GMAIL_PASS, LINKEDIN_USER, LINKEDIN_PASS, ADMIN_TOKEN, RECIPIENTS)
