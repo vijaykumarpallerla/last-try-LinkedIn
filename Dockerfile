@@ -51,9 +51,3 @@ COPY deploy/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 EXPOSE 8080 6081 6901 5900
 
 USER appuser
-
-# Use supervisord to run processes (nginx forwarded by root by supervisord entrypoint)
-ENTRYPOINT ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
-
-WORKDIR /home/appuser/app
-RUN mkdir -p /home/appuser/logs && chown -R appuser:appuser /home/appuser/logs
