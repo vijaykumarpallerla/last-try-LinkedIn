@@ -43,9 +43,12 @@ RUN mkdir -p /opt/novnc && \
     && apt-get update && apt-get install -y unzip && unzip /tmp/novnc.zip -d /opt && mv /opt/noVNC-master /opt/novnc && rm /tmp/novnc.zip
 
 
+
 # Copy nginx and supervisord confs
 COPY deploy/nginx.conf /etc/nginx/nginx.conf
 COPY deploy/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+# Debug: print supervisord.conf to verify correct config in image
+RUN cat /etc/supervisor/conf.d/supervisord.conf
 
 # Expose nothing explicitly (Render provides $PORT). For local testing we expose ports too:
 EXPOSE 8080 6081 6901 5900
