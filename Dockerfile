@@ -44,9 +44,16 @@ RUN mkdir -p /opt/novnc && \
 
 
 
+# Install envsubst (gettext-base) so we can template nginx.conf at container start
+RUN apt-get update && apt-get install -y gettext-base
+
 # Copy nginx and supervisord confs
-COPY deploy/nginx.conf /etc/nginx/nginx.conf
+# nginx.conf is copied as a template; supervisord will run envsubst to substitute ${PORT}
+# Copy nginx template and supervisord conf
+COPY deploy/nginx.conf /etc/nginx/nginx.conf.template
 COPY deploy/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY deploy/startup.sh /home/appuser/app/deploy/startup.sh
+RUN chmod +x /home/appuser/app/deploy/startup.sh
 # Debug: print supervisord.conf to verify correct config in image
 RUN cat /etc/supervisor/conf.d/supervisord.conf
 
