@@ -18,17 +18,12 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime, timedelta
 import re
-from selenium.common.exceptions import StaleElementReferenceException, ElementClickInterceptedException, NoSuchElementException
 import hashlib
 import tempfile
 import uuid
 from urllib.parse import quote_plus
 import requests
 import difflib
-import gzip
-import base64
-import shutil
-import sys
 
 # --- CONFIGURATION ---
 SENT_JOBS_FILE = 'sent-jobs.json'
@@ -66,44 +61,6 @@ def _load_dotenv_optional(env_path='.env'):
 
 
 _load_dotenv_optional()
-
-# Helper: on Windows, try reading Chrome version from registry when --version output is unreliable
-def get_windows_chrome_version():
-    try:
-        import winreg
-    except Exception:
-        return None
-    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-        for sub in (r"SOFTWARE\\Google\\Chrome\\BLBeacon", r"SOFTWARE\\WOW6432Node\\Google\\Chrome\\BLBeacon"):
-            try:
-                with winreg.OpenKey(hive, sub) as k:
-                    try:
-                        val, _ = winreg.QueryValueEx(k, 'version')
-                        if val:
-                            return val
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    return None
-
-
-def is_chrome_running_on_windows():
-    """Return True if any chrome.exe processes are running on Windows."""
-    try:
-        if not sys.platform.startswith('win'):
-            return False
-        # Use tasklist to detect chrome.exe processes
-        out = os.popen('tasklist /FI "IMAGENAME eq chrome.exe" /NH').read()
-        if not out:
-            return False
-        # tasklist returns a line with 'INFO: No tasks are running which match the specified criteria.' when none
-        if 'No tasks are running' in out or 'INFO:' in out:
-            return False
-        # Otherwise presence of 'chrome.exe' indicates running processes
-        return 'chrome.exe' in out.lower()
-    except Exception:
-        return False
 
 # Create Flask app
 app = Flask(__name__)
@@ -385,112 +342,6 @@ scraper_status.setdefault('ai_filter_stats', {'kept': 0, 'skipped': 0, 'errors':
 scraper_status.setdefault('extracted_emails_count', 0)
 scraper_status.setdefault('extracted_emails_file', '')
 
-# Paused sessions mapping: token -> {'driver': selenium.webdriver, 'created_at': timestamp, 'expires': ts}
-# Stored in-memory only; tokens are short-lived.
-paused_sessions = {}
-
-def _make_token():
-    return uuid.uuid4().hex
-
-def _ensure_dir(path: str):
-    d = os.path.dirname(path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-def _save_artifacts(driver, token: str):
-    # Save screenshot and html.gz paths for this token
-    ss_path = os.path.join('data', 'screenshots', f'{token}.png')
-    html_path = os.path.join('data', 'html', f'{token}.html.gz')
-    _ensure_dir(ss_path)
-    _ensure_dir(html_path)
-    try:
-        driver.save_screenshot(ss_path)
-    except Exception:
-        try:
-            # fallback to executing JS to get a base64 screenshot (Playwright alternative) if available
-            b64 = driver.get_screenshot_as_base64()
-            with open(ss_path, 'wb') as f:
-                f.write(base64.b64decode(b64))
-        except Exception:
-            pass
-    try:
-        html = driver.page_source
-        with gzip.open(html_path, 'wt', encoding='utf-8') as gz:
-            gz.write(html)
-    except Exception:
-        try:
-            html = ''
-            with gzip.open(html_path, 'wt', encoding='utf-8') as gz:
-                gz.write(html)
-        except Exception:
-            pass
-    return ss_path, html_path
-
-
-def _save_live_screenshot(driver):
-    """Save a single live screenshot and gzipped HTML to a known path for UI live view.
-
-    This writes to data/live.png and data/live.html.gz (overwriting previous).
-    Returns (png_path, html_path) or (None, None) on failure.
-    """
-    try:
-        png = os.path.join('data', 'live.png')
-        htmlp = os.path.join('data', 'live.html.gz')
-        _ensure_dir(png)
-        _ensure_dir(htmlp)
-        try:
-            driver.save_screenshot(png)
-        except Exception:
-            try:
-                b64 = driver.get_screenshot_as_base64()
-                with open(png, 'wb') as f:
-                    f.write(base64.b64decode(b64))
-            except Exception:
-                return None, None
-        try:
-            page = driver.page_source or ''
-            with gzip.open(htmlp, 'wt', encoding='utf-8') as gz:
-                gz.write(page)
-        except Exception:
-            try:
-                with gzip.open(htmlp, 'wt', encoding='utf-8') as gz:
-                    gz.write('')
-            except Exception:
-                pass
-        return png, htmlp
-    except Exception:
-        logger.exception('Failed saving live screenshot')
-        return None, None
-
-def _send_email_simple(to_addrs: list | str, subject: str, body: str, attachments: list = None):
-    # Simple SMTP send using GMAIL_USER/GMAIL_PASS or SMTP_* env vars
-    gmail_user = os.getenv('GMAIL_USER')
-    gmail_pass = os.getenv('GMAIL_PASS')
-    if isinstance(to_addrs, str):
-        to_list = [r.strip() for r in to_addrs.split(',') if r.strip()]
-    else:
-        to_list = to_addrs or []
-    if not to_list:
-        logger.warning('No recipients for _send_email_simple')
-        return False
-    if not gmail_user or not gmail_pass:
-        logger.warning('_send_email_simple: SMTP credentials not configured')
-        return False
-    try:
-        msg = MIMEText(body)
-        msg['Subject'] = subject
-        msg['From'] = gmail_user
-        msg['To'] = ', '.join(to_list)
-        server = smtplib.SMTP_SSL(os.getenv('SMTP_HOST') or 'smtp.gmail.com', int(os.getenv('SMTP_PORT') or 465), timeout=20)
-        server.login(gmail_user, gmail_pass)
-        server.sendmail(gmail_user, to_list, msg.as_string())
-        server.quit()
-        return True
-    except Exception:
-        logger.exception('Failed to send notification email')
-        return False
-
-
 # Global stop signal for immediate user-requested cancellation
 stop_event = threading.Event()
 
@@ -723,316 +574,49 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
         scraper_status['progress'] = 'Setting up browser...'
         logger.info('Scraper: Setting up browser...')
         chrome_options = Options()
-        # When running in a container/headless environment we need several flags so
-        # Chromium can start reliably (Render, Docker, CI). Allow override via HEADLESS env.
-        headless_env = os.getenv('HEADLESS', 'true').lower() in ('1', 'true', 'yes')
-        if headless_env:
-            # Newer Chrome supports --headless=new; fallback to --headless
-            try:
-                chrome_options.add_argument("--headless=new")
-            except Exception:
-                chrome_options.add_argument("--headless")
-        # Platform-specific Chrome flags: minimal on Windows, fuller set in containers/Linux
-        if sys.platform.startswith('win'):
-            # Windows: prefer minimal options to avoid crashes when launching headless Chrome
-            chrome_options.add_argument("--disable-extensions")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--window-size=1920,1080")
-        else:
-            # Non-Windows (Linux/macOS/containers): use more robust flags for containerized Chrome
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--disable-extensions")
-            chrome_options.add_argument("--disable-software-rasterizer")
-            chrome_options.add_argument("--remote-debugging-port=9222")
-            chrome_options.add_argument("--window-size=1920,1080")
-            # Some platforms benefit from this to avoid zygote permission issues
-            chrome_options.add_argument("--no-zygote")
-            chrome_options.add_argument("--single-process")
-        # Use an isolated temporary profile to ensure Chrome starts as a separate
-        # instance instead of opening a tab in the user's existing browser.
-        try:
-            profile_dir = tempfile.mkdtemp(prefix='linkedin-scraper-profile-')
-            chrome_options.add_argument(f"--user-data-dir={profile_dir}")
-        except Exception:
-            profile_dir = None
-        # Reduce automation flags noise
-        try:
-            chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
-        except Exception:
-            pass
+        # Comment out the line below to see the browser in action
+        # chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
 
-        # Try to find Chrome/Chromium binary. Prefer an explicit env var, then common Linux and Windows paths.
-        chrome_bin_env = os.getenv('CHROME_BIN') or os.getenv('GOOGLE_CHROME_BIN') or os.getenv('CHROME_PATH')
+        # Try to find Chrome binary in common Windows locations (helps when Chrome isn't on PATH)
+        chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe")
+        ]
         chrome_found = False
-        tried_candidates = []
-        if chrome_bin_env:
-            tried_candidates.append(('env', chrome_bin_env))
-            # Sometimes the env var may point to a symlink or non-exact path; try shutil.which on the basename too
-            try:
-                if os.path.exists(chrome_bin_env) or os.access(chrome_bin_env, os.X_OK):
-                    chrome_options.binary_location = chrome_bin_env
-                    logger.info(f"Scraper: Using CHROME_BIN from env: {chrome_bin_env}")
-                    chrome_found = True
-                else:
-                    # try resolving by name
-                    bn = os.path.basename(chrome_bin_env)
-                    resolved = shutil.which(bn) or ''
-                    if resolved and os.path.exists(resolved):
-                        chrome_options.binary_location = resolved
-                        logger.info(f"Scraper: Resolved CHROME_BIN name '{bn}' to {resolved}")
-                        chrome_found = True
-                    else:
-                        logger.info(f"Scraper: CHROME_BIN env set to '{chrome_bin_env}' but file not found or not executable")
-            except Exception:
-                logger.exception('Error while evaluating CHROME_BIN')
-
-        # Platform-agnostic lookups (Linux-first, then Windows). Use shutil.which where possible.
-        if not chrome_found:
-            # Common linux binary names and explicit paths (keep order of preference)
-            linux_candidates = [
-                shutil.which('google-chrome-stable') or '',
-                shutil.which('google-chrome') or '',
-                shutil.which('chromium-browser') or '',
-                shutil.which('chromium') or '',
-                '/usr/bin/google-chrome',
-                '/usr/bin/chromium-browser',
-                '/usr/bin/chromium',
-                '/snap/bin/chromium'
-            ]
-            for p in linux_candidates:
-                if not p:
-                    continue
-                tried_candidates.append(('candidate', p))
-                try:
-                    if os.path.exists(p) and os.access(p, os.X_OK):
-                        chrome_options.binary_location = p
-                        logger.info(f"Scraper: Found Chrome/Chromium binary at {p}")
-                        chrome_found = True
-                        break
-                except Exception:
-                    logger.exception(f'Error while checking candidate path: {p}')
-
-        # If still not found, log what we tried to help diagnostics
-        if not chrome_found:
-            try:
-                logger.info('Scraper: Chrome detection tried the following candidates: %s', tried_candidates)
-            except Exception:
-                pass
-
-        # Fall back to checking common Windows locations (for local Windows dev)
-        if not chrome_found:
-            chrome_paths = [
-                r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-                r"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-                os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe")
-            ]
-            for p in chrome_paths:
-                if os.path.exists(p):
-                    chrome_options.binary_location = p
-                    logger.info(f"Scraper: Found Chrome binary at {p}")
-                    chrome_found = True
-                    break
+        for p in chrome_paths:
+            if os.path.exists(p):
+                chrome_options.binary_location = p
+                logger.info(f"Scraper: Found Chrome binary at {p}")
+                chrome_found = True
+                break
 
         if not chrome_found:
             # Give a clear message both in terminal and UI status
             msg = (
-                "Chrome/Chromium browser binary not found. Please install Google Chrome/Chromium or set the path via the CHROME_BIN env var. "
-                "On Linux, common paths are /usr/bin/google-chrome or /usr/bin/chromium-browser."
+                "Chrome browser binary not found. Please install Google Chrome or set the path to your "
+                "chrome.exe in the code (chrome_options.binary_location). Common Windows paths are: "
+                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe or your user AppData path."
             )
             logger.error('Scraper: ' + msg)
             scraper_status['progress'] = msg
             scraper_status['is_running'] = False
             return
 
-        # Choose chromedriver: prefer system-installed, else use webdriver-manager
-        chromedriver_path = None
-        service = None
+        # Use webdriver-manager to automatically download/locate chromedriver
         try:
-            system_cd = shutil.which('chromedriver') or '/usr/bin/chromedriver'
-            if system_cd and os.path.exists(system_cd) and os.access(system_cd, os.X_OK):
-                chromedriver_path = system_cd
-                service = Service(executable_path=chromedriver_path)
-                logger.info(f"Scraper: Using system chromedriver at {chromedriver_path}")
-                try:
-                    out = os.popen(f'"{chromedriver_path}" --version').read().strip()
-                    if out:
-                        logger.info(f"Scraper: chromedriver version: {out}")
-                except Exception:
-                    pass
-            else:
-                # Detect browser version and request a matching chromedriver
-                browser_bin = chrome_options.binary_location or shutil.which('chromium') or shutil.which('chromium-browser') or shutil.which('google-chrome')
-                browser_version = None
-                if browser_bin and os.path.exists(browser_bin):
-                    try:
-                        # On Windows calling chrome.exe --version can open a browser window
-                        # (which previously caused an extra empty tab). Prefer reading from
-                        # the registry when on Windows to avoid side effects.
-                        if sys.platform.startswith('win'):
-                            out = get_windows_chrome_version() or ''
-                        else:
-                            out = os.popen(f'"{browser_bin}" --version').read().strip()
-                        logger.info(f"Scraper: Detected browser version output: {out}")
-                        # Ignore spurious messages that indicate Chrome opened a UI
-                        if out and 'opening in existing' in out.lower():
-                            out = ''
-                        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", out)
-                        if m:
-                            browser_version = m.group(1)
-                        else:
-                            m2 = re.search(r"(\d+)\.", out)
-                            if m2:
-                                browser_version = m2.group(1)
-                    except Exception:
-                        logger.exception('Failed to read browser version')
-
-                try:
-                    # webdriver-manager changed its constructor signature in some
-                    # versions. Try to call with 'version' first, otherwise fall
-                    # back to the no-arg constructor and rely on the returned
-                    # path from install().
-                    try:
-                        if browser_version:
-                            chromedriver_path = ChromeDriverManager(version=browser_version).install()
-                        else:
-                            chromedriver_path = ChromeDriverManager().install()
-                    except TypeError:
-                        # Older/newer webdriver-manager may expect no 'version'
-                        # kwarg; try the maker without kwargs and pass a
-                        # matching_version param to install if available.
-                        mgr = ChromeDriverManager()
-                        try:
-                            # try install with matching_version param
-                            if browser_version:
-                                chromedriver_path = mgr.install(matching_version=browser_version)
-                            else:
-                                chromedriver_path = mgr.install()
-                        except TypeError:
-                            # Last resort: call install() without matching
-                            chromedriver_path = mgr.install()
-                    service = Service(executable_path=chromedriver_path)
-                    logger.info(f"Scraper: Using chromedriver at {chromedriver_path}")
-                except Exception:
-                    logger.exception('Scraper: webdriver-manager failed; falling back to PATH for chromedriver')
-                    service = Service()
+            chromedriver_path = ChromeDriverManager().install()
+            service = Service(executable_path=chromedriver_path)
+            logger.info(f'Scraper: Using chromedriver at {chromedriver_path}')
         except Exception:
-            logger.warning('Scraper: chromedriver detection failed; falling back to PATH')
+            # Fallback: assume chromedriver is on PATH
+            logger.warning('Scraper: webdriver-manager failed, falling back to PATH for chromedriver')
             service = Service()
 
         _assert_not_stopped()
-
-        # On developer Windows machines, an already-running Chrome process can cause the driver
-        # to attach to the user's browser (opening a normal tab). If the user explicitly requests
-        # headless mode (HEADLESS=true) allow the scraper to proceed; otherwise abort with a helpful
-        # message so the user can either close Chrome or set HEADLESS=true.
-        # Allow a forced UI override (risky) via env FORCE_UI=true to bypass this check
-        force_ui = os.getenv('FORCE_UI', '').lower() in ('1', 'true', 'yes')
-        logger.info('Scraper: headless_env=%s force_ui=%s', headless_env, force_ui)
-        if not headless_env and is_chrome_running_on_windows() and not force_ui:
-            msg = 'Chrome is currently running on this machine. Close Chrome or set HEADLESS=true to run the scraper.'
-            logger.error('Scraper: ' + msg)
-            scraper_status['progress'] = msg
-            scraper_status['is_running'] = False
-            return
-        if force_ui:
-            logger.warning('Scraper: FORCE_UI enabled - attempting visible UI run despite running Chrome (may attach to existing profile)')
-
-        # Helper to create a fresh webdriver instance
-        def create_driver():
-            try:
-                _assert_not_stopped()
-                drv = webdriver.Chrome(service=service, options=chrome_options)
-                logger.info('Scraper: New WebDriver instance created, session id=%s', getattr(drv, 'session_id', None))
-                return drv
-            except Exception:
-                logger.exception('Scraper: Failed to create WebDriver')
-                raise
-
-        # Helper to perform login steps into LinkedIn on a given driver instance
-        def do_login(drv):
-            try:
-                _assert_not_stopped()
-                drv.get('https://www.linkedin.com/login')
-                time.sleep(2)
-                retry_on_stale(lambda: drv.find_element(By.ID, 'username').clear())
-                retry_on_stale(lambda: drv.find_element(By.ID, 'username').send_keys(linkedin_user))
-                retry_on_stale(lambda: drv.find_element(By.ID, 'password').clear())
-                retry_on_stale(lambda: drv.find_element(By.ID, 'password').send_keys(linkedin_pass))
-                retry_on_stale(lambda: drv.find_element(By.XPATH, '//*[@type="submit"]').click())
-                time.sleep(5)
-            except Exception:
-                logger.exception('Scraper: Exception during login')
-                raise
-
-        # Safe get helper: tries driver.get and recreates driver+login on invalid session
-        def safe_get(drv, url, attempts=2):
-            for attempt in range(attempts):
-                try:
-                    _assert_not_stopped()
-                    drv.get(url)
-                    return drv
-                except Exception as e:
-                    # If session invalid, try to recreate and re-login
-                    from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
-                    if isinstance(e, InvalidSessionIdException) or 'invalid session id' in str(e).lower() or isinstance(e, WebDriverException):
-                        logger.warning('Scraper: Detected invalid webdriver session; attempting to recreate (attempt %s/%s)', attempt+1, attempts)
-                        try:
-                            try:
-                                drv.quit()
-                            except Exception:
-                                pass
-                            drv = create_driver()
-                            do_login(drv)
-                            continue
-                        except Exception:
-                            logger.exception('Scraper: Failed to recreate driver during safe_get')
-                            raise
-                    else:
-                        raise
-            # If we exit loop, raise
-            raise RuntimeError('safe_get: failed to load url after retries')
-
-        driver = create_driver()
-        # Save an initial live screenshot so the UI can show something
-        try:
-            _save_live_screenshot(driver)
-        except Exception:
-            pass
-        # Some ChromeDriver/Chrome combinations open an extra initial blank tab
-        # (about:blank or data:,). Give Chrome a short moment to populate handles
-        # and then close any truly empty startup tabs so the user sees the real
-        # controlled tab. Be conservative to avoid closing legitimate pages.
-        try:
-            time.sleep(0.35)
-            handles = list(driver.window_handles)
-            if len(handles) > 1:
-                for h in list(handles):
-                    try:
-                        driver.switch_to.window(h)
-                        cur = (driver.current_url or '').strip()
-                    except Exception:
-                        cur = ''
-                    if not cur or cur in ('about:blank', 'data:,'):
-                        logger.info('Scraper: Closing empty startup tab (url=%s)', cur)
-                        try:
-                            driver.close()
-                        except Exception:
-                            pass
-                # Switch to first remaining window if any
-                try:
-                    remaining = driver.window_handles
-                    if remaining:
-                        try:
-                            driver.switch_to.window(remaining[0])
-                        except Exception:
-                            logger.debug('Scraper: failed switching to first window handle after cleanup')
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        driver = webdriver.Chrome(service=service, options=chrome_options)
 
         # Helper: check for common LinkedIn human verification / checkpoint pages
         def is_human_verification_page(drv):
@@ -1053,109 +637,42 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                 return True
             return False
 
-        # Utility to retry an action if the page updates and elements become stale.
-        def retry_on_stale(fn, attempts: int = 3, delay: float = 0.4):
-            last_exc = None
-            for i in range(attempts):
-                try:
-                    return fn()
-                except StaleElementReferenceException as e:
-                    last_exc = e
-                    time.sleep(delay)
-                except ElementClickInterceptedException as e:
-                    # transient overlay, wait and retry
-                    last_exc = e
-                    time.sleep(delay)
-            # If we get here, re-raise the last exception for visibility
-            if last_exc:
-                raise last_exc
-            return None
-
         # --- LinkedIn Login ---
         scraper_status['progress'] = 'Logging into LinkedIn...'
         logger.info('Scraper: Logging into LinkedIn...')
         _assert_not_stopped()
-        # Perform initial login using the helper (will raise on failure)
-        do_login(driver)
-        # capture screenshot after login for live view
-        try:
-            _save_live_screenshot(driver)
-        except Exception:
-            pass
+        driver.get("https://www.linkedin.com/login")
+        time.sleep(2)
+        _assert_not_stopped()
+        driver.find_element(By.ID, "username").send_keys(linkedin_user)
+        driver.find_element(By.ID, "password").send_keys(linkedin_pass)
+        driver.find_element(By.XPATH, '//*[@type="submit"]').click()
+        time.sleep(5) # Wait for login and redirect
 
         # After login, detect if LinkedIn has challenged with human verification.
         # If so, pause the scraper and wait until the verification page clears, then auto-resume.
         if is_human_verification_page(driver):
-            # Create a short-lived token and save artifacts so recipient can submit OTP via the UI
-            token = _make_token()
-            expires = datetime.utcnow() + timedelta(minutes=int(os.getenv('OTP_TOKEN_MINUTES', '15')))
-            scraper_status['progress'] = 'Paused: LinkedIn requested human verification. Waiting for OTP submission.'
+            scraper_status['progress'] = 'Waiting: LinkedIn requested human verification. Complete it in the opened browser; the scraper will resume automatically.'
             scraper_status['paused_for_human_verification'] = True
-            logger.warning('Scraper: Human verification detected; creating OTP token and notifying recipient/admin')
+            logger.warning('Scraper: Human verification detected. Waiting for completion to auto-resume...')
 
-            # Save artifacts
-            ss_path, html_path = _save_artifacts(driver, token)
-            # Log token and artifact locations so admins can find them in logs
-            try:
-                logger.info(f"Scraper: Paused token={token}; screenshot={ss_path}; html={html_path}")
-            except Exception:
-                pass
-
-            # Store paused session metadata (we do NOT keep the raw driver in paused_sessions to avoid pickling issues across process restarts)
-            # Keep an in-memory reference to the driver so the OTP handler can inject it.
-            paused_sessions[token] = {
-                'created_at': datetime.utcnow().isoformat(),
-                'expires_at': expires.isoformat(),
-                'screenshot': ss_path,
-                'html': html_path,
-                'job_hint': {'url': driver.current_url},
-                'driver_ref': driver
-            }
-
-            # Build OTP link for recipient - point to submit-otp endpoint
-            base = os.getenv('BASE_URL') or (request.url_root.rstrip('/') if request else 'https://your-render-app')
-            otp_link = f"{base}/submit-otp?token={token}"
-
-            # Send an email to recipients (the person who will enter OTP). Use RECIPIENTS env or settings
-            recipient_emails = os.getenv('RECIPIENTS') or load_settings().get('recipients') or ''
-            subj = f"Action required: LinkedIn verification for scraping job - enter OTP"
-            body = (
-                f"We encountered a human verification while scraping LinkedIn for your request.\n\n"
-                f"Please click the secure link and enter the OTP you received from LinkedIn. This link expires at {expires.isoformat()} UTC.\n\n"
-                f"Open link: {otp_link}\n\n"
-                "If you did not request this, ignore this message. Do not forward the link."
-            )
-            # Try to email recipients (best-effort). Also email ADMIN_EMAIL if configured for ops.
-            try:
-                _send_email_simple(recipient_emails, subj, body)
-            except Exception:
-                logger.exception('Failed sending OTP email to recipients')
-
-            admin_email = os.getenv('ADMIN_EMAIL') or load_settings().get('admin_email')
-            if admin_email:
-                try:
-                    _send_email_simple(admin_email, f"[ADMIN] Human verification paused - token {token}", f"Job paused at {driver.current_url}. Token: {token}")
-                except Exception:
-                    logger.exception('Failed sending admin alert email')
-
-            # Wait for OTP submission: token will be validated by /api/submit-otp which will set scraper_status['resume_requested']=True
             wait_seconds = int(os.getenv('HUMAN_VERIFY_TIMEOUT', '900'))  # default 15 minutes
             start = time.time()
             while True:
                 _assert_not_stopped()
-                # If admin/recipient submitted OTP (resume_requested flag set), attempt to read from a temp storage
+                # If admin explicitly signaled resume, allow immediate continuation as an override
                 if scraper_status.get('resume_requested'):
-                    # The OTP handler is responsible for injecting the OTP into the page; the handler should then clear resume_requested
-                    logger.info('Scraper: Resume requested flag detected; continuing')
+                    logger.info('Scraper: Admin override resume received; continuing')
                     scraper_status['resume_requested'] = False
                     break
 
-                # Also auto-resume if page no longer appears to be a verification page
+                # Auto-resume once the page is no longer a verification/checkpoint page
                 try:
                     if not is_human_verification_page(driver):
                         logger.info('Scraper: Human verification appears completed; resuming')
                         break
                 except Exception:
+                    # If we cannot read the page (e.g., transient), ignore and continue waiting
                     pass
 
                 if time.time() - start > wait_seconds:
@@ -1167,14 +684,13 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                         pass
                     scraper_status['is_running'] = False
                     return
-
-                # Sleep small increments to be responsive to stop_event
+                # Stop-aware wait to remain responsive
                 for _ in range(20):
                     if stop_event.is_set():
                         _assert_not_stopped()
                     time.sleep(0.1)
 
-            # Clear paused state and continue
+            # Clear paused state and update progress before continuing
             scraper_status['paused_for_human_verification'] = False
             scraper_status['progress'] = 'Human verification completed; resuming scraping...'
 
@@ -1188,6 +704,155 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
 
         # regex to match recent time indicators like '2h', '5 hr', '10m', 'just now', etc.
         recent_time_re = re.compile(r"\b\d+\s*(?:h|hr|m|min)\b|just now|\bjust now\b|\b\d+\s*min\b", re.IGNORECASE)
+
+        # --- Scrape Home Feed (when no keywords/search/groups provided) ---
+        try:
+            # Use the function parameters `keywords` and `groups` here (they exist earlier)
+            if (not use_keywords_search) and (not keywords or str(keywords).strip() == '') and not groups:
+                _assert_not_stopped()
+                scraper_status['progress'] = 'Scraping LinkedIn Home feed...'
+                logger.info('Scraper: Scraping LinkedIn Home feed')
+                # Also print an explicit marker so the terminal shows it even if logging is misconfigured
+                print('[SCRAPER-DEBUG] Entered home feed branch')
+                try:
+                    # Try to dismiss common cookie/consent banners which can hide the feed
+                    for txt in ('Accept cookies', 'Accept all', 'Accept', 'I agree', 'Agree'):
+                        try:
+                            btns = driver.find_elements(By.XPATH, f"//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{txt.lower()}')]")
+                            for b in btns[:2]:
+                                try:
+                                    b.click()
+                                    logger.info(f"Scraper: Clicked cookie/consent button '{txt}'")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    driver.get('https://www.linkedin.com/feed/')
+                except Exception:
+                    # sometimes LinkedIn redirects; continue with current page
+                    pass
+                time.sleep(4)
+
+                # gentle scroll to load content
+                for _ in range(4):
+                    _assert_not_stopped()
+                    try:
+                        driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
+                    except Exception:
+                        pass
+                    for __ in range(15):
+                        if stop_event.is_set():
+                            _assert_not_stopped()
+                        time.sleep(0.1)
+
+                posts = []
+                try:
+                    posts = driver.find_elements(By.CSS_SELECTOR, 'article, .feed-shared-update-v2')
+                except Exception:
+                    posts = []
+
+                logger.info(f"Scraper: Found {len(posts)} raw post elements in home feed")
+                print(f'[SCRAPER-DEBUG] Found posts count: {len(posts)}')
+                recent_count = 0
+                sample_texts = []
+                for post in posts:
+                    _assert_not_stopped()
+                    try:
+                        # Expand possible 'See more' buttons
+                        more_buttons = post.find_elements(By.XPATH, ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'see more') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'more')]")
+                        for b in more_buttons[:2]:
+                            try:
+                                b.click(); time.sleep(0.1)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                    post_text = (post.text or '').strip()
+                    if not post_text:
+                        continue
+                    # Skip non-recent posts
+                    if not bool(recent_time_re.search(post_text)):
+                        continue
+
+                    # Basic cleaning similar to group scraping
+                    lines = [l.strip() for l in post_text.splitlines() if l.strip()]
+                    cleaned_lines = []
+                    prev = None
+                    in_comment_section = False
+                    for l in lines:
+                        low = l.lower()
+                        if not in_comment_section:
+                            if low == '1 comment' or bool(re.match(r"^\d+\s+comments?$", low)):
+                                in_comment_section = True
+                                continue
+                        if in_comment_section:
+                            continue
+                        if low.startswith('like') or low.startswith('likes') or low.startswith('comment') or low.startswith('comments') or 'share' in low:
+                            continue
+                        if prev is not None and l == prev:
+                            continue
+                        cleaned_lines.append(l)
+                        prev = l
+                    cleaned_text = '\n'.join(cleaned_lines).strip()
+
+                    # extract contacts
+                    emails, phones = extract_contacts_from_text(cleaned_text)
+                    if not emails and not phones:
+                        emails2, phones2 = extract_contacts_from_text(post_text)
+                        if emails2:
+                            emails = emails2
+                        if phones2:
+                            phones = phones2
+
+                    # anchors
+                    try:
+                        anchors = post.find_elements(By.TAG_NAME, 'a')
+                        stable_id = _extract_linkedin_activity_id_from_anchors(anchors)
+                        if not stable_id:
+                            stable_id = f"txt:{hashlib.sha256(_normalize_text_for_id(post_text).encode('utf-8')).hexdigest()}"
+                    except Exception:
+                        stable_id = f"txt:{hashlib.sha256(_normalize_text_for_id(post_text).encode('utf-8')).hexdigest()}"
+
+                    job = {
+                        'text': cleaned_text or post_text,
+                        'raw_text': post_text,
+                        'emails': emails,
+                        'phones': phones,
+                        'group_name': 'Home Feed',
+                        'group_url': 'https://www.linkedin.com/feed/',
+                        'id': stable_id,
+                        'ai_reason': ''
+                    }
+                    all_job_posts.append(job)
+                    recent_count += 1
+                    if len(sample_texts) < 5:
+                        sample_texts.append((cleaned_text or post_text)[:400])
+
+                try:
+                    gs = scraper_status.get('groups_summary', [])
+                    gs.append({'name': 'Home Feed', 'url': 'https://www.linkedin.com/feed/', 'recent_count': recent_count})
+                    scraper_status['groups_summary'] = gs
+                    scraper_status['last_found_total'] = len(all_job_posts)
+                    scraper_status['sample_posts'] = sample_texts
+                    # If we found nothing, save a screenshot for debugging and update status
+                    if len(posts) == 0:
+                        try:
+                            path = _save_live_screenshot(driver)
+                            msg = f'No posts found on feed; saved screenshot to {path}'
+                            scraper_status['progress'] = msg
+                            logger.info('Scraper: ' + msg)
+                            print('[SCRAPER-DEBUG] ' + msg)
+                        except Exception:
+                            scraper_status['progress'] = 'No posts found on feed; failed saving screenshot'
+                            print('[SCRAPER-DEBUG] Failed saving screenshot for empty feed')
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception('Scraper: Error while scraping home feed')
 
         def try_click_posts_and_sort_latest(drv, timeout: int = 15, slow: bool = False):
             wait = WebDriverWait(drv, timeout)
@@ -1581,135 +1246,6 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
             pass
         ai_stats = {'kept': 0, 'skipped': 0, 'errors': 0}
 
-        # --- Scrape Home Feed first ---
-        try:
-            _assert_not_stopped()
-            scraper_status['progress'] = 'Scraping LinkedIn Home Feed...'
-            logger.info('Scraper: Scraping Home Feed')
-            # Load feed
-            driver = safe_get(driver, 'https://www.linkedin.com/feed/')
-            time.sleep(3)
-            # gentle scroll to load recent posts
-            for _ in range(4):
-                _assert_not_stopped()
-                try:
-                    driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
-                except Exception:
-                    pass
-                for __ in range(15):
-                    if stop_event.is_set():
-                        _assert_not_stopped()
-                    time.sleep(0.1)
-                try:
-                    _save_live_screenshot(driver)
-                except Exception:
-                    pass
-
-            posts = []
-            try:
-                posts = driver.find_elements(By.CSS_SELECTOR, ".feed-shared-update-v2")
-            except Exception:
-                posts = []
-            if not posts:
-                try:
-                    posts = driver.find_elements(By.CSS_SELECTOR, "article, .feed-shared-update-v2")
-                except Exception:
-                    posts = []
-            logger.info(f"Scraper: Feed found {len(posts)} post elements")
-            feed_count = 0
-            # limit posts from feed to avoid very long runs
-            try:
-                max_feed = int(os.getenv('MAX_FEED_POSTS') or 50)
-            except Exception:
-                max_feed = 50
-            for post in posts[:max_feed]:
-                _assert_not_stopped()
-                try:
-                    # expand see more
-                    more_buttons = post.find_elements(By.XPATH, ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'see more') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'more')]")
-                    for b in more_buttons[:2]:
-                        try:
-                            retry_on_stale(lambda b=b: b.click())
-                            time.sleep(0.1)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                post_text = ''
-                try:
-                    post_text = post.text or ''
-                except Exception:
-                    post_text = ''
-                if not post_text:
-                    continue
-                if not bool(recent_time_re.search(post_text)):
-                    continue
-
-                # AI filter
-                reason = ''
-                if ai_enabled:
-                    try:
-                        keep, reason = ai_is_usa_hiring_post(post_text)
-                        if keep and is_promo_training(post_text) and not seems_hiring(post_text):
-                            keep = False
-                            reason = (reason or '') + ' | promo-training'
-                        if keep:
-                            bad_loc = is_disallowed_location(post_text)
-                            if bad_loc:
-                                keep = False
-                                reason = (reason or '') + f' | non-usa-location: {bad_loc}'
-                        if not keep:
-                            ai_stats['skipped'] += 1
-                            continue
-                        else:
-                            ai_stats['kept'] += 1
-                    except Exception:
-                        ai_stats['errors'] += 1
-                        continue
-
-                emails, phones = extract_contacts_from_text(post_text)
-                try:
-                    anchors = post.find_elements(By.TAG_NAME, 'a')
-                    stable_id = _extract_linkedin_activity_id_from_anchors(anchors)
-                    for a in anchors:
-                        try:
-                            href = (a.get_attribute('href') or '')
-                            if href.startswith('mailto:'):
-                                addr = href.split(':', 1)[1].split('?')[0]
-                                if addr and addr not in emails:
-                                    emails.append(addr)
-                        except Exception:
-                            pass
-                except Exception:
-                    anchors = []
-                    stable_id = None
-
-                if not stable_id:
-                    stable_id = f"feed:{hashlib.sha256(_normalize_text_for_id(post_text).encode('utf-8')).hexdigest()}"
-
-                all_job_posts.append({
-                    'text': post_text,
-                    'raw_text': post_text,
-                    'emails': emails,
-                    'phones': phones,
-                    'group_name': 'Home Feed',
-                    'group_url': 'https://www.linkedin.com/feed/',
-                    'id': stable_id,
-                    'ai_reason': reason
-                })
-                feed_count += 1
-
-            try:
-                gs = scraper_status.get('groups_summary', [])
-                gs.append({'name': 'Home Feed', 'url': 'https://www.linkedin.com/feed/', 'recent_count': feed_count})
-                scraper_status['groups_summary'] = gs
-                scraper_status['last_found_total'] = len(all_job_posts)
-            except Exception:
-                pass
-        except Exception:
-            logger.exception('Scraper: Error while scraping Home Feed')
-
         if use_keywords_search and kw_list:
             for kw in kw_list:
                 _assert_not_stopped()
@@ -1722,7 +1258,7 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                 logger.info(scraper_status['progress'])
                 try:
                     _assert_not_stopped()
-                    driver = safe_get(driver, search_url)
+                    driver.get(search_url)
                     time.sleep(3)
                     # One-shot Sort by → Latest (visual confirmation; no loops)
                     try:
@@ -1739,11 +1275,6 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                             if stop_event.is_set():
                                 _assert_not_stopped()
                             time.sleep(0.1)
-                        # Update live screenshot after scrolling
-                        try:
-                            _save_live_screenshot(driver)
-                        except Exception:
-                            pass
 
                     # Collect post containers (try multiple selectors)
                     posts = []
@@ -1766,8 +1297,7 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                             more_buttons = post.find_elements(By.XPATH, ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'see more') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'more')]")
                             for b in more_buttons[:2]:
                                 try:
-                                    retry_on_stale(lambda b=b: b.click())
-                                    time.sleep(0.1)
+                                    b.click(); time.sleep(0.1)
                                 except Exception:
                                     pass
                         except Exception:
@@ -1865,7 +1395,7 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
             _assert_not_stopped()
             scraper_status['progress'] = f"Scraping group: {group['name']}..."
             logger.info(f"Scraper: Scraping group: {group['name']}...")
-            driver = safe_get(driver, group['url'])
+            driver.get(group['url'])
             time.sleep(4)
 
             # Scroll to load more posts
@@ -1877,11 +1407,6 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                     if stop_event.is_set():
                         _assert_not_stopped()
                     time.sleep(0.1)
-                # Update live screenshot after scrolling
-                try:
-                    _save_live_screenshot(driver)
-                except Exception:
-                    pass
 
             posts = driver.find_elements(By.CSS_SELECTOR, ".feed-shared-update-v2")
             logger.info(f"Scraper: Found {len(posts)} raw post elements in group '{group['name']}'")
@@ -1894,7 +1419,7 @@ def scraper_task(gmail_user, gmail_pass, recipient_emails, linkedin_user, linked
                     see_more_buttons = post.find_elements(By.XPATH, ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'see more')]")
                     for b in see_more_buttons:
                         try:
-                            retry_on_stale(lambda b=b: b.click())
+                            b.click()
                             time.sleep(0.2)
                         except Exception:
                             pass
@@ -2510,8 +2035,7 @@ def index():
         env = {
             'GMAIL_USER': os.getenv('GMAIL_USER'),
             'RECIPIENTS': recipient_emails,
-            'LINKEDIN_USER': linkedin_user,
-            'WEBSOCKIFY_URL': os.getenv('WEBSOCKIFY_URL') or ''
+            'LINKEDIN_USER': linkedin_user
         }
         return render_template('index.html', started=True, settings=settings, env=env, admin_token=ADMIN_TOKEN)
 
@@ -2525,8 +2049,7 @@ def index():
     env = {
         'GMAIL_USER': os.getenv('GMAIL_USER'),
         'RECIPIENTS': os.getenv('RECIPIENTS'),
-        'LINKEDIN_USER': os.getenv('LINKEDIN_USER'),
-        'WEBSOCKIFY_URL': os.getenv('WEBSOCKIFY_URL') or ''
+        'LINKEDIN_USER': os.getenv('LINKEDIN_USER')
     }
     # Pass ADMIN_TOKEN to the template so client JS can include it in admin requests if present
     return render_template('index.html', settings=settings, env=env, admin_token=ADMIN_TOKEN)
@@ -2594,67 +2117,7 @@ def status():
         report['stop_requested'] = stop_event.is_set()
     except Exception:
         report['stop_requested'] = False
-    # If there's an active paused session, include a public token and a submit URL
-    try:
-        if paused_sessions:
-            # pick the most-recent paused token (insertion order)
-            try:
-                token = next(iter(paused_sessions.keys()))
-                report['paused_token'] = token
-                # include a job hint if available
-                try:
-                    hj = paused_sessions.get(token, {}).get('job_hint')
-                    report['paused_job_hint'] = hj
-                except Exception:
-                    report['paused_job_hint'] = None
-                base = os.getenv('BASE_URL') or (request.url_root.rstrip('/') if request else None)
-                if base:
-                    report['paused_submit_url'] = f"{base}/submit-otp?token={token}"
-                else:
-                    report['paused_submit_url'] = f"/submit-otp?token={token}"
-            except Exception:
-                pass
-    except Exception:
-        pass
     return jsonify(report)
-
-
-@app.route('/screenshot/latest')
-def latest_screenshot():
-    """Return the latest live screenshot (data/live.png) if available."""
-    p = os.path.join('data', 'live.png')
-    if not os.path.exists(p):
-        return jsonify({'ok': False, 'error': 'no-screenshot'}), 404
-    try:
-        return send_file(p, mimetype='image/png')
-    except Exception:
-        logger.exception('Failed to serve latest screenshot')
-        return jsonify({'ok': False, 'error': 'failed'}), 500
-
-
-@app.route('/screenshot/token/<token>')
-def screenshot_for_token(token):
-    """Serve a paused-session screenshot saved under data/screenshots/{token}.png
-
-    This is useful when live view isn't updating; admins can open this URL to download the exact
-    screenshot captured when the session paused.
-    """
-    try:
-        # If the paused session has a path recorded, prefer that
-        ss_path = None
-        try:
-            if token in paused_sessions:
-                ss_path = paused_sessions.get(token, {}).get('screenshot')
-        except Exception:
-            ss_path = None
-        if not ss_path:
-            ss_path = os.path.join('data', 'screenshots', f'{token}.png')
-        if not os.path.exists(ss_path):
-            return jsonify({'ok': False, 'error': 'screenshot not found', 'path': ss_path}), 404
-        return send_file(ss_path, mimetype='image/png')
-    except Exception:
-        logger.exception('Failed to serve token screenshot')
-        return jsonify({'ok': False, 'error': 'failed'}), 500
 
 
 @app.route('/stop', methods=['POST'])
@@ -2670,16 +2133,6 @@ def stop_scraper():
     except Exception:
         logger.exception('Failed to request stop')
         return jsonify({'ok': False, 'error': 'failed to request stop'}), 500
-
-
-@app.route('/vnc/')
-def vnc_page():
-    """Simple page that hosts an embedded noVNC client or shows instructions when not configured."""
-    # Prefer an explicit env variable passed in, else rely on Flask's environment
-    ws = os.getenv('WEBSOCKIFY_URL') or ''
-    # pass env mapping for template to access
-    env = {'WEBSOCKIFY_URL': ws}
-    return render_template('vnc.html', env=env)
 
 
 @app.route('/test-smtp', methods=['GET'])
@@ -3096,276 +2549,5 @@ def admin_resume_scraper():
         logger.exception('Admin: Failed to resume scraper')
         return jsonify({'ok': False, 'error': 'failed to resume'}), 500
 
-
-@app.route('/submit-otp', methods=['GET'])
-def submit_otp_form():
-    token = request.args.get('token')
-    if not token or token not in paused_sessions:
-        return "Invalid or expired token.", 400
-    # Simple HTML form for OTP entry
-    return f"""
-    <html><body>
-    <h3>Enter the OTP from LinkedIn</h3>
-    <p>This will submit the OTP to the paused scraping session so the job can resume.</p>
-    <form action="/api/submit-otp" method="post">
-      <input type="hidden" name="token" value="{token}" />
-      OTP: <input name="otp" />
-      <button type="submit">Submit OTP</button>
-    </form>
-    </body></html>
-    """
-
-
-@app.route('/api/submit-otp', methods=['POST'])
-def api_submit_otp():
-    data = request.get_json(silent=True) or request.form or {}
-    token = data.get('token')
-    otp = data.get('otp')
-    if not token or token not in paused_sessions:
-        return jsonify({'ok': False, 'error': 'invalid or expired token'}), 400
-    if not otp:
-        return jsonify({'ok': False, 'error': 'otp required'}), 400
-    sess = paused_sessions.get(token)
-    driver = sess.get('driver_ref') if sess else None
-    if not driver:
-        return jsonify({'ok': False, 'error': 'server-side browser session not available'}), 500
-    try:
-        injected = False
-        # Attempt common OTP input selectors
-        try:
-            candidates = driver.find_elements(By.XPATH, "//input[@name='pin' or @name='otp' or @id='otp' or @type='tel' or @type='text']")
-        except Exception:
-            candidates = []
-        for c in candidates:
-            try:
-                c.clear()
-                c.send_keys(otp)
-                injected = True
-            except Exception:
-                continue
-        if not injected:
-            try:
-                active = driver.switch_to.active_element
-                active.clear()
-                active.send_keys(otp)
-                injected = True
-            except Exception:
-                injected = False
-
-        if not injected:
-            return jsonify({'ok': False, 'error': 'failed to inject otp: no suitable input found'}), 500
-
-        # Try to click verify/submit buttons
-        try:
-            buttons = driver.find_elements(By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'verify') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'submit') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'continue')]")
-            for b in buttons[:3]:
-                try:
-                    b.click()
-                except Exception:
-                    try:
-                        driver.execute_script("arguments[0].click();", b)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # Signal scraper to resume; scraper loop checks page state and will continue
-        scraper_status['resume_requested'] = True
-        try:
-            del paused_sessions[token]
-        except Exception:
-            pass
-        return jsonify({'ok': True, 'message': 'OTP submitted; scraper will attempt to resume.'})
-    except Exception as e:
-        logger.exception('Error injecting OTP into paused session')
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-
-@app.route('/api/remote/click', methods=['POST'])
-def api_remote_click():
-    """Remote click into paused Selenium session.
-
-    Expected JSON: {token: str, x: float, y: float}
-    x,y are normalized coords (0..1) relative to the served live screenshot image.
-    The server maps them into the page viewport using JS-exposed window.innerWidth/innerHeight
-    and attempts a native click via ActionChains. Falls back to elementFromPoint+dispatchEvent.
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    token = data.get('token')
-    if not token or token not in paused_sessions:
-        return jsonify({'ok': False, 'error': 'invalid or expired token'}), 400
-    try:
-        x = float(data.get('x'))
-        y = float(data.get('y'))
-    except Exception:
-        return jsonify({'ok': False, 'error': 'x and y (normalized floats) required'}), 400
-    sess = paused_sessions.get(token)
-    driver = sess.get('driver_ref') if sess else None
-    if not driver:
-        return jsonify({'ok': False, 'error': 'server-side browser session not available'}), 500
-    try:
-        # Ask the page for its viewport size via JS so we can convert normalized coords
-        try:
-            vw = driver.execute_script('return window.innerWidth||document.documentElement.clientWidth')
-            vh = driver.execute_script('return window.innerHeight||document.documentElement.clientHeight')
-        except Exception:
-            vw = None
-            vh = None
-        if vw and vh:
-            px = int(max(0, min(1, x)) * int(vw))
-            py = int(max(0, min(1, y)) * int(vh))
-        else:
-            # Fallback: assume 1920x1080
-            px = int(max(0, min(1, x)) * 1920)
-            py = int(max(0, min(1, y)) * 1080)
-
-        # Try a native Selenium click by computing element at point using JS
-        performed = False
-        try:
-            # Try elementFromPoint to get the element and scroll into view then click via ActionChains
-            el = driver.execute_script('return document.elementFromPoint(arguments[0], arguments[1]);', px, py)
-            if el:
-                # We have an element reference; try to click it natively
-                try:
-                    # Move to location and click
-                    ActionChains(driver).move_by_offset(0, 0).perform()
-                except Exception:
-                    pass
-                try:
-                    # Use JS to click the element directly if possible
-                    driver.execute_script('arguments[0].scrollIntoView({block:"center"});', el)
-                except Exception:
-                    pass
-                try:
-                    ActionChains(driver).move_to_element_with_offset(el, 1, 1).click().perform()
-                    performed = True
-                except Exception:
-                    try:
-                        driver.execute_script('arguments[0].click();', el)
-                        performed = True
-                    except Exception:
-                        performed = False
-        except Exception:
-            performed = False
-
-        # If the above didn't work, try dispatching a pointer event at page coordinates
-        if not performed:
-            try:
-                js = (
-                    'var ev = new MouseEvent("click", {bubbles:true, cancelable:true, clientX:arguments[0], clientY:arguments[1]});'
-                    'var el = document.elementFromPoint(arguments[0], arguments[1]); if(el) el.dispatchEvent(ev); return !!el;'
-                )
-                ok = driver.execute_script(js, px, py)
-                performed = bool(ok)
-            except Exception:
-                performed = False
-
-        # Save a live screenshot so UI can refresh immediately
-        try:
-            _save_live_screenshot(driver)
-        except Exception:
-            pass
-
-        if performed:
-            return jsonify({'ok': True, 'message': 'clicked', 'px': px, 'py': py})
-        else:
-            return jsonify({'ok': False, 'error': 'click failed'}), 500
-    except Exception as e:
-        logger.exception('api_remote_click error')
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-
-@app.route('/api/remote/type', methods=['POST'])
-def api_remote_type():
-    """Send text input to the active/focused element in the paused session.
-
-    Expected JSON: {token: str, text: str}
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    token = data.get('token')
-    text = data.get('text')
-    if not token or token not in paused_sessions:
-        return jsonify({'ok': False, 'error': 'invalid or expired token'}), 400
-    if text is None:
-        return jsonify({'ok': False, 'error': 'text required'}), 400
-    sess = paused_sessions.get(token)
-    driver = sess.get('driver_ref') if sess else None
-    if not driver:
-        return jsonify({'ok': False, 'error': 'server-side browser session not available'}), 500
-    try:
-        try:
-            active = driver.switch_to.active_element
-            active.click()
-            active.clear()
-            active.send_keys(text)
-        except Exception:
-            # Fallback: focus body and send keys
-            try:
-                driver.execute_script('document.activeElement && document.activeElement.blur && document.activeElement.blur();')
-            except Exception:
-                pass
-            try:
-                driver.execute_script('var i = document.querySelector("input[type=text], input[type=tel], input[name*=otp], textarea"); if(i){ i.focus(); }')
-                el = driver.switch_to.active_element
-                el.send_keys(text)
-            except Exception:
-                driver.execute_script('console.warn("remote type fallback failed")')
-                return jsonify({'ok': False, 'error': 'failed to type into element'}), 500
-        try:
-            _save_live_screenshot(driver)
-        except Exception:
-            pass
-        return jsonify({'ok': True, 'message': 'typed'})
-    except Exception as e:
-        logger.exception('api_remote_type error')
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-
-@app.route('/api/remote/key', methods=['POST'])
-def api_remote_key():
-    """Send a special key (Enter, Tab, Escape) to the active element.
-
-    Expected JSON: {token: str, key: 'Enter'|'Tab'|'Escape'}
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    token = data.get('token')
-    key = data.get('key')
-    if not token or token not in paused_sessions:
-        return jsonify({'ok': False, 'error': 'invalid or expired token'}), 400
-    if not key:
-        return jsonify({'ok': False, 'error': 'key required'}), 400
-    sess = paused_sessions.get(token)
-    driver = sess.get('driver_ref') if sess else None
-    if not driver:
-        return jsonify({'ok': False, 'error': 'server-side browser session not available'}), 500
-    try:
-        k = key.lower()
-        from selenium.webdriver.common.keys import Keys as SKeys
-        mapping = {
-            'enter': SKeys.ENTER,
-            'tab': SKeys.TAB,
-            'escape': SKeys.ESCAPE,
-            'esc': SKeys.ESCAPE,
-        }
-        send = mapping.get(k)
-        if not send:
-            return jsonify({'ok': False, 'error': 'unsupported key'}), 400
-        try:
-            active = driver.switch_to.active_element
-            active.send_keys(send)
-        except Exception:
-            try:
-                driver.execute_script('document.activeElement && document.activeElement.dispatchEvent(new KeyboardEvent("keydown", {key: arguments[0]}));', key)
-            except Exception:
-                return jsonify({'ok': False, 'error': 'failed to send key'}), 500
-        try:
-            _save_live_screenshot(driver)
-        except Exception:
-            pass
-        return jsonify({'ok': True, 'message': 'key sent'})
-    except Exception as e:
-        logger.exception('api_remote_key error')
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+if __name__ == '__main__':
+    app.run(debug=True, port=5001)
